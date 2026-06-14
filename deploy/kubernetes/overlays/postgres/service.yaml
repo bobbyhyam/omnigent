@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: omnigent
+    component: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: omnigent
+    component: postgres
+  ports:
+    - port: 5432
+      targetPort: postgres
+      protocol: TCP
+      name: postgres
