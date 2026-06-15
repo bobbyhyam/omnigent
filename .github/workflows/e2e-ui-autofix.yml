@@ -1,0 +1,215 @@
+name: E2E UI Autofix
+
+# Post-merge regression auto-fix (Part 2, Priority 1). Fork PRs don't run the
+# e2e_ui suite pre-merge (no secrets), so a contributor PR can merge and then
+# break e2e_ui on main. This reacts to the per-merge "E2E UI Tests" run failing
+# on main: it re-checks for flakiness, then has a coding agent DIAGNOSE the
+# failure -- updating a stale test (intended UI change) or, if it looks like a
+# real product regression, opening an issue instead of mutating the test. Output
+# is always a reviewed PR/issue; Maintainer Approval still gates any merge.
+#
+# Trigger is workflow_run (trusted: runs from the default branch with secrets +
+# write token). It checks out the failed commit on main -- already merged,
+# human-reviewed code -- never PR-head code, so there's no untrusted-code risk.
+#
+# leak-scan-allow: workflow_run
+on:
+  workflow_run:
+    workflows: ["E2E UI Tests"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      override_tests:
+        description: "Dry-run: comma-separated failing test node IDs"
+        required: false
+      override_pr:
+        description: "Dry-run: culprit PR number"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-ui-autofix-${{ github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  autofix:
+    name: autofix
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'failure' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.event == 'push')
+    permissions:
+      contents: write       # push the fix branch (App token preferred; see below)
+      pull-requests: write  # open the fix PR, request review, comment
+      issues: write         # open a suspected-regression issue / comment
+      actions: read         # download the failed run's junit artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout the failed commit on main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # Don't leave a push token on disk: the agent step runs in this tree.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+      - name: Set up Node 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ap-web/package-lock.json
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        with:
+          enable-cache: true
+
+      - name: Set LLM credentials
+        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
+      - name: Install project + dev extras
+        run: uv sync --extra all --extra dev
+
+      - name: Install binary dependencies (claude-code)
+        working-directory: .github/ci-deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y tmux ripgrep bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          npm install --ignore-scripts
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+      - name: Build ap-web SPA
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          cd ap-web
+          npm ci --legacy-peer-deps --no-audit --no-fund
+          npm run build
+
+      - name: Mint App token
+        id: app-token
+        if: vars.OSS_REGEN_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.OSS_REGEN_APP_ID }}
+          private-key: ${{ secrets.OSS_REGEN_APP_KEY }}
+
+      - name: Resolve culprit + failing tests
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          OVERRIDE_TESTS: ${{ github.event.inputs.override_tests }}
+          OVERRIDE_PR: ${{ github.event.inputs.override_pr }}
+        run: bash .github/scripts/e2e-ui-autofix/resolve.sh
+
+      - name: Flake re-check
+        id: flake
+        if: steps.resolve.outputs.proceed == 'true'
+        env:
+          OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          RECHECK_ATTEMPTS: "2"
+        run: bash .github/scripts/e2e-ui-autofix/flake-recheck.sh
+
+      - name: Report transient flake (no fix needed)
+        if: steps.flake.outputs.persistent_count == '0' && steps.resolve.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "🤖 Post-merge e2e_ui failure cleared on re-run (transient flake); no fix needed." || true
+
+      - name: Dedup guard
+        id: dedup
+        if: steps.flake.outputs.persistent_count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.resolve.outputs.pr_number || github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          branch="e2e-ui-autofix/pr-${SLUG}"
+          if gh api "repos/$REPO/branches/$branch" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$branch already exists; skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure claude for the gateway
+        if: steps.flake.outputs.persistent_count != '0' && steps.dedup.outputs.exists == 'false'
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          LLM_API_KEY: ${{ env.LLM_API_KEY }}
+        run: bash .github/scripts/e2e-ui-agent/setup-claude.sh
+
+      - name: Build agent prompt
+        id: prompt
+        if: steps.flake.outputs.persistent_count != '0' && steps.dedup.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
+          PROMPT_FILE: ${{ runner.temp }}/agent-prompt.txt
+          AGENT_REPORT: ${{ runner.temp }}/agent-report.md
+        run: bash .github/scripts/e2e-ui-autofix/build-prompt.sh
+
+      - name: Run agent (gateway creds only, no GitHub token)
+        if: steps.flake.outputs.persistent_count != '0' && steps.dedup.outputs.exists == 'false'
+        env:
+          # Deliberately NO GH_TOKEN here: the agent gets gateway creds only.
+          OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          PROMPT_FILE: ${{ runner.temp }}/agent-prompt.txt
+          MAX_TURNS: "40"
+          AGENT_TIMEOUT_S: "1500"
+        run: bash .github/scripts/e2e-ui-agent/run-agent.sh
+
+      - name: Enforce path allowlist
+        if: steps.flake.outputs.persistent_count != '0' && steps.dedup.outputs.exists == 'false'
+        env:
+          ALLOW_PREFIX: tests/e2e_ui/
+        run: bash .github/scripts/e2e-ui-agent/enforce-allowlist.sh
+
+      - name: Independent verification (re-run persistent tests)
+        id: verify
+        if: steps.flake.outputs.persistent_count != '0' && steps.dedup.outputs.exists == 'false'
+        env:
+          OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(grep . artifacts/persistent-tests.txt || true)
+          if [[ ${#tests[@]} -eq 0 ]]; then echo "result=green" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if uv run pytest "${tests[@]}" --ui-skip-build -p no:cacheprovider -r a; then
+            echo "result=green" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open fix PR / regression issue + notify
+        if: steps.flake.outputs.persistent_count != '0' && steps.dedup.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
+          AUTHOR: ${{ steps.resolve.outputs.author }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          AGENT_REPORT: ${{ runner.temp }}/agent-report.md
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+          FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: bash .github/scripts/e2e-ui-autofix/decide-open.sh
