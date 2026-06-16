@@ -537,6 +537,74 @@ def test_resolve_provider_antigravity_unconfigured_is_none(
     assert "no Gemini credential" in provider.detail
 
 
+# ── Antigravity: runnable-but-non-enumerable vs. genuinely unusable ──
+
+
+def test_antigravity_api_key_listing_is_runnable_not_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured antigravity (api-key) worker reads as runnable, not dead.
+
+    The regression this guards: ``_listing_for_provider`` used to render every
+    ``kind="none"`` provider — including a Gemini-native antigravity worker
+    holding a credential — as "cannot run here," telling orchestrators a valid
+    worker was unusable. A worker with an api-key CAN run; only its models are
+    non-enumerable. The listing must say so (``source="runnable"``) and never
+    emit the dead-worker signal.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec("antigravity", auth=ApiKeyAuth(api_key="AIza-test"))
+    listing = list_models_for_worker(spec, "antigravity")
+    assert listing.source == "runnable"
+    assert listing.models == ()
+    assert "can run" in listing.note
+    assert "cannot run here" not in listing.note
+
+
+def test_antigravity_vertex_listing_is_runnable_not_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured antigravity Vertex worker also reads as runnable.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity", "vertex": True}),
+    )
+    listing = list_models_for_worker(spec, "antigravity")
+    assert listing.source == "runnable"
+    assert listing.models == ()
+    assert "cannot run here" not in listing.note
+
+
+def test_antigravity_unconfigured_listing_reads_as_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A keyless antigravity worker still reads as unusable (dead-worker signal).
+
+    The complement to the runnable cases: with no Gemini credential anywhere,
+    the worker genuinely cannot run, so the listing must keep the
+    ``source="none"`` "cannot run here" preflight signal.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    for var in ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    _isolate_config(monkeypatch, tmp_path, "")
+    listing = list_models_for_worker(_worker_spec("antigravity"), "antigravity")
+    assert listing.source == "none"
+    assert listing.models == ()
+    assert "cannot run here" in listing.note
+
+
 # ── Enumeration per provider kind ──────────────────────────
 
 

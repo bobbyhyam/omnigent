@@ -1103,17 +1103,30 @@ def _describe_antigravity_credential(
     ``base_url`` (the SDK has no OpenAI-compatible endpoint), and the model is
     whatever the session pinned (no provider default to fall back on).
 
+    The configured reference is *resolved* before it is reported: a dangling
+    ``env:MISSING`` / keychain reference (whose secret no longer exists) reads
+    as not-configured, matching what ``_build_antigravity_spawn_env`` would
+    actually thread (it uses :func:`resolve_antigravity_api_key`, which omits an
+    unresolvable ref). Reporting an unresolved ref would overclaim an active
+    credential the spawn path silently drops.
+
     :param config: The parsed config mapping (the ``antigravity:`` block).
     :param model_override: The in-session ``/model`` override, or ``None``.
     :returns: A :class:`ResolvedCredential` describing the Gemini key, or
-        ``None`` when no key is configured or ambient.
+        ``None`` when no key is configured (or its reference is dangling) and
+        none is ambient.
     """
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_ENV_VARS,
         antigravity_api_key_ref,
+        resolve_antigravity_api_key,
     )
 
+    # Resolve, don't just read: a configured-but-dangling ref must not be
+    # reported as active, since the spawn path would drop it (see docstring).
     ref = antigravity_api_key_ref(config)
+    if ref is not None and resolve_antigravity_api_key(config) is None:
+        ref = None
     if ref is None:
         ambient = next((var for var in ANTIGRAVITY_ENV_VARS if os.environ.get(var)), None)
         if ambient is None:

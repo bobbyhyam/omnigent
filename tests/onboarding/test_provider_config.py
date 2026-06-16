@@ -488,6 +488,50 @@ def test_describe_active_credential_antigravity_none_when_unconfigured(
     assert describe_active_credential({}, "antigravity") is None
 
 
+def test_describe_active_credential_antigravity_dangling_ref_reads_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dangling ``env:`` antigravity ref reads as NOT configured in the readout.
+
+    The regression this guards: the readout used to report an active credential
+    whenever the ``antigravity:`` block carried a reference, WITHOUT resolving
+    it. A dangling ``env:MISSING`` / keychain ref (whose secret no longer exists)
+    would then show an active Gemini credential in ``/model`` / the startup
+    header — yet ``_build_antigravity_spawn_env`` uses
+    ``resolve_antigravity_api_key`` and silently omits it, so the worker runs
+    with no key. The readout must resolve the ref first and mark it unconfigured
+    when resolution fails. With no ambient Gemini var either, the readout is
+    ``None``.
+    """
+    from omnigent.onboarding.provider_config import describe_active_credential
+
+    for var in ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY", "MISSING_GEMINI"):
+        monkeypatch.delenv(var, raising=False)
+    # The block references an env var that is not set — a dangling ref.
+    config = {"antigravity": {"api_key_ref": "env:MISSING_GEMINI"}}
+    assert describe_active_credential(config, "antigravity") is None
+
+
+def test_describe_active_credential_antigravity_dangling_ref_falls_back_to_ambient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dangling config ref does not suppress a genuinely-present ambient key.
+
+    Complement to the dangling-ref test: when the configured ref does not
+    resolve but an ambient ``GEMINI_API_KEY`` IS set, the readout reports the
+    ambient credential (mirroring the spawn-env fallback), not ``None``.
+    """
+    from omnigent.onboarding.provider_config import describe_active_credential
+
+    monkeypatch.delenv("ANTIGRAVITY_API_KEY", raising=False)
+    monkeypatch.delenv("MISSING_GEMINI", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-ambient")
+    config = {"antigravity": {"api_key_ref": "env:MISSING_GEMINI"}}
+    cred = describe_active_credential(config, "antigravity")
+    assert cred is not None
+    assert cred.source == "env:GEMINI_API_KEY"
+
+
 def test_provider_family_for_harness_antigravity_is_google() -> None:
     """Antigravity reports its own ``google`` family, not ``openai``.
 

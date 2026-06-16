@@ -21,6 +21,10 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → a curated static list (source ``"static"``,
   ``verified: false`` — CLI logins expose no listing API).
+- a runnable-but-non-enumerable provider (a Gemini-native antigravity
+  worker holding a credential) → source ``"runnable"`` with an empty
+  list and a note saying the worker can run but its models cannot be
+  listed here.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -139,7 +143,8 @@ class ModelListing:
     """A worker's enumerated model list plus its provenance.
 
     :param source: Where the list came from — ``"gateway"``,
-        ``"openai-compatible"``, ``"anthropic-api"``, ``"static"``, or
+        ``"openai-compatible"``, ``"anthropic-api"``, ``"static"``,
+        ``"runnable"`` (runnable worker with no enumerable listing), or
         ``"none"``.
     :param verified: ``True`` when the list was fetched live from the
         provider; ``False`` for static/curated or empty listings.
@@ -174,6 +179,14 @@ class ResolvedModelProvider:
     :param cli: ``"claude"`` / ``"codex"`` for ``kind="subscription"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
+    :param runnable: Whether a dispatch to this worker can actually run,
+        even when its models cannot be enumerated. Only meaningful for
+        ``kind="none"``: ``True`` marks a configured-but-non-enumerable
+        provider (e.g. a Gemini-native antigravity worker with an api-key
+        / Vertex / ambient credential — runnable, but with no listing
+        endpoint), distinguishing it from a genuinely unusable worker
+        (``False`` — no credential resolved). Enumerable kinds leave it
+        ``False`` since their runnability is implied by a live listing.
     """
 
     kind: str
@@ -184,6 +197,7 @@ class ResolvedModelProvider:
     auth_command: str | None = None
     cli: str | None = None
     detail: str = ""
+    runnable: bool = False
 
 
 # Unfiltered listings keyed by provider identity. TTLCache is not thread-safe
@@ -503,13 +517,18 @@ def _legacy_antigravity_provider(spec: Any) -> ResolvedModelProvider:  # type: i
     base URL to fetch from), so this always resolves to ``kind="none"`` — the
     dispatch gate then passes the spec's model through unchanged and
     ``sys_list_models`` reports the worker as non-enumerable rather than
-    fabricating an OpenAI-family list the worker can never run. The
-    :attr:`~ResolvedModelProvider.detail` records whether a credential was
-    found, so the readout still distinguishes a configured worker from an
-    unconfigured one.
+    fabricating an OpenAI-family list the worker can never run.
+
+    The :attr:`~ResolvedModelProvider.runnable` flag is what keeps that
+    "non-enumerable" honest: a worker with a credential (api-key / Vertex /
+    ambient) CAN run — it just cannot list its models — so it is marked
+    ``runnable=True`` and the listing renders as runnable-without-a-listing.
+    A worker with no Gemini credential anywhere is genuinely unusable, so it
+    stays ``runnable=False`` (the dead-worker preflight signal).
 
     :param spec: The worker's (sub-)agent spec.
-    :returns: A :class:`ResolvedModelProvider` with ``kind="none"``.
+    :returns: A :class:`ResolvedModelProvider` with ``kind="none"``;
+        ``runnable=True`` when a Gemini credential resolved.
     """
     from omnigent.spec.types import ApiKeyAuth
 
@@ -518,6 +537,7 @@ def _legacy_antigravity_provider(spec: Any) -> ResolvedModelProvider:  # type: i
         return ResolvedModelProvider(
             kind=NONE_KIND,
             detail="antigravity Vertex AI (Gemini-native; no enumerable model listing)",
+            runnable=True,
         )
 
     spec_auth = spec.executor.auth
@@ -525,11 +545,13 @@ def _legacy_antigravity_provider(spec: Any) -> ResolvedModelProvider:  # type: i
         return ResolvedModelProvider(
             kind=NONE_KIND,
             detail="antigravity api_key auth (Gemini-native; no enumerable model listing)",
+            runnable=True,
         )
     if spec_auth is None and _antigravity_ambient_key_present():
         return ResolvedModelProvider(
             kind=NONE_KIND,
             detail="antigravity ambient Gemini key (Gemini-native; no enumerable model listing)",
+            runnable=True,
         )
     return ResolvedModelProvider(
         kind=NONE_KIND,
@@ -786,6 +808,20 @@ def _listing_for_provider(
     :returns: The provider's :class:`ModelListing`.
     """
     if provider.kind == NONE_KIND:
+        if provider.runnable:
+            # Runnable, but with no listing endpoint (e.g. a Gemini-native
+            # antigravity worker holding a credential): dispatches CAN run, the
+            # models just cannot be enumerated. Report that, not "cannot run."
+            return ModelListing(
+                source="runnable",
+                verified=False,
+                models=(),
+                note=(
+                    f"{provider.detail} — dispatches to this worker can run, but "
+                    "its models cannot be enumerated here (no listing endpoint); "
+                    "pass the worker's own model id through unchanged"
+                ),
+            )
         return ModelListing(
             source=NONE_KIND,
             verified=False,
