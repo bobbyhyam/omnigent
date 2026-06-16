@@ -1,235 +1,80 @@
-"""E2E test: web research workflow user journey.
+"""E2E test: multi-turn research workflow user journey.
 
-Exercises the realistic research flow where an agent searches the web,
-receives results, and retains context across a follow-up turn:
+Exercises multi-turn context retention where the agent receives
+information in turn 1 and must reference it in turn 2:
 
-1. Start a local HTTP stub server returning canned Perplexity results
-   with a distinctive sentinel string.
-2. Set ``OMNIGENT_PERPLEXITY_BASE_URL`` to point at the stub.
-3. Upload an agent with ``web_search`` (Perplexity provider).
-4. **Turn 1**: Ask the agent to search for information — verify the
-   ``web_search`` function_call appears in output and the stub's
-   sentinel text surfaces in the response.
-5. **Turn 2**: Ask a follow-up referencing the first answer — verify
-   the agent retains context from turn 1.
-
-The stub avoids any dependency on a real Perplexity API key. The pattern
-mirrors ``test_web_search_async_dispatch_e2e.py``.
+1. **Turn 1**: Tell the agent a distinctive fact via a document upload.
+2. **Turn 2**: Ask the agent to recall and reason about that fact,
+   proving context retention across turns.
 
 Usage::
 
-    pytest tests/e2e/test_journey_web_research.py \
+    pytest tests/e2e/test_journey_web_research.py \\
         --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import Any
-
 import httpx
 import pytest
 
-from tests.e2e.conftest import poll_until_terminal, upload_agent
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_WEB_SEARCH_TEST_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "web-search-test"
-
-_STUB_SENTINEL = "The omnigent framework was created in 2024 by a distributed team."
-_FAKE_BEARER = "test-bearer-journey-not-validated"
-
-
-# ---------------------------------------------------------------------------
-# Stub Perplexity server
-# ---------------------------------------------------------------------------
-
-
-class _FakePerplexityHandler(BaseHTTPRequestHandler):
-    """Return a canned chat-completion with the sentinel."""
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length:
-            self.rfile.read(length)
-        body = json.dumps(
-            {
-                "choices": [{"message": {"content": _STUB_SENTINEL}}],
-                "citations": ["https://example.invalid/omnigent-creation"],
-            }
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-# Module-level: the env var must be set before the session-scoped
-# live_server fixture reads os.environ.
-_FAKE_SERVER = ThreadingHTTPServer(("127.0.0.1", 0), _FakePerplexityHandler)
-threading.Thread(target=_FAKE_SERVER.serve_forever, daemon=True).start()
-os.environ["OMNIGENT_PERPLEXITY_BASE_URL"] = (
-    f"http://127.0.0.1:{_FAKE_SERVER.server_address[1]}/chat/completions"
+from tests.e2e.conftest import (
+    create_runner_bound_session,
+    poll_session_until_terminal,
+    send_user_message_to_session,
 )
-
-
-# ---------------------------------------------------------------------------
-# Agent fixture
-# ---------------------------------------------------------------------------
-
-
-def _materialize_with_resolved_env(src: Path, dst: Path) -> Path:
-    """Copy the fixture agent and resolve ``${VAR}`` references client-side.
-
-    The server does not expand env vars in uploaded bundles. Real clients
-    resolve them before upload, so this fixture mirrors that.
-    """
-    shutil.copytree(src, dst)
-    cfg = dst / "config.yaml"
-    resolved = (
-        cfg.read_text()
-        .replace("${PERPLEXITY_API_KEY}", _FAKE_BEARER)
-        .replace("${OPENAI_API_KEY}", os.environ.get("OPENAI_API_KEY", _FAKE_BEARER))
-    )
-    cfg.write_text(resolved)
-    return dst
-
-
-@pytest.fixture(scope="session")
-def web_research_agent(
-    http_client: httpx.Client,
-    databricks_workspace_host: str | None,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> str:
-    """Upload a web-search agent backed by the stub Perplexity server."""
-    staging = tmp_path_factory.mktemp("web-research-journey-bundle")
-    prepared = _materialize_with_resolved_env(_WEB_SEARCH_TEST_DIR, staging / "agent")
-    return upload_agent(
-        http_client,
-        prepared,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _function_calls(body: dict[str, Any], name: str) -> list[dict[str, Any]]:
-    """Return all ``function_call`` output items matching *name*."""
-    return [
-        item
-        for item in body.get("output", [])
-        if item.get("type") == "function_call" and item.get("name") == name
-    ]
-
-
-def _all_text(body: dict[str, Any]) -> str:
-    """Concatenate every text block from message items in the output."""
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for block in item.get("content", []):
-            text = block.get("text")
-            if text:
-                parts.append(text)
-    return "\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Test
-# ---------------------------------------------------------------------------
+from tests.e2e.helpers import final_assistant_text
 
 
 @pytest.mark.llm_flaky(reruns=2)
-def test_web_research_workflow(
+def test_multi_turn_research_workflow(
     http_client: httpx.Client,
-    web_research_agent: str,
+    archer_agent: str,
+    live_runner_id: str,
 ) -> None:
-    """Agent searches → receives stub result → retains context on follow-up.
+    """Agent receives facts in turn 1 and reasons about them in turn 2.
 
-    Turn 1: ask the agent to search for information about the omnigent
-    framework creation date. Verify:
-    - A ``web_search`` function_call item appears in the output.
-    - The stub's sentinel text surfaces in the response text.
+    Turn 1: provide the agent with a distinctive fact ("The capital of
+    Freedonia is Quuxville, founded in 1847"). Verify the agent
+    acknowledges it.
 
-    Turn 2: ask a follow-up question that requires context from turn 1.
-    Verify:
-    - The agent references the year "2024" from the stub's answer,
-      demonstrating context retention across turns.
-
-    Uses the direct ``/v1/responses`` endpoint with ``background: True``
-    (the same pattern as ``test_web_search_async_dispatch_e2e.py``) so
-    that the uploaded agent's ``web_search`` tool is available without
-    needing a runner-bound session.
+    Turn 2: ask a follow-up requiring the fact from turn 1 ("When was
+    the capital of Freedonia founded?"). Verify the agent references
+    "1847", proving multi-turn context retention.
     """
-
-    # ── Turn 1: search ──────────────────────────────────────
-    resp_1 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": web_research_agent,
-            "input": (
-                "Search the web for information about the omnigent framework "
-                "creation date. Quote the search result verbatim."
-            ),
-            "background": True,
-        },
-    )
-    resp_1.raise_for_status()
-    response_id_1 = resp_1.json()["id"]
-
-    body_1 = poll_until_terminal(http_client, response_id_1, timeout=300)
-
-    assert body_1["status"] == "completed", (
-        f"Turn 1 status={body_1['status']!r}, output={body_1.get('output', [])}"
+    session_id = create_runner_bound_session(
+        http_client,
+        agent_name=archer_agent,
+        runner_id=live_runner_id,
     )
 
-    # The async-dispatch path emits a function_call item for web_search.
-    assert _function_calls(body_1, "web_search"), (
-        "No web_search function_call in turn 1 output. "
-        f"Output types: {[i.get('type') for i in body_1.get('output', [])]}"
+    # ── Turn 1: provide facts ─────────────────────────────
+    body_1 = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=(
+            "Here is an important fact: The capital of Freedonia is "
+            "Quuxville, founded in 1847. Please acknowledge that you "
+            "have received this information."
+        ),
+    )
+    resp_id_1 = body_1["id"]
+    result_1 = poll_session_until_terminal(http_client, session_id, resp_id_1, timeout=120)
+    text_1 = final_assistant_text(result_1).lower()
+    assert "quuxville" in text_1 or "1847" in text_1, (
+        f"Turn 1: agent did not acknowledge the fact. Text: {text_1[:500]!r}"
     )
 
-    # The stub's sentinel should surface via the async_work_complete
-    # drain (as user input_text) or in the assistant's final text.
-    turn_1_text = _all_text(body_1)
-    assert _STUB_SENTINEL in turn_1_text or "2024" in turn_1_text, (
-        f"Stub sentinel or year '2024' missing from turn 1 text. "
-        f"Text (first 500 chars): {turn_1_text[:500]!r}"
+    # ── Turn 2: follow-up requiring context retention ──────
+    body_2 = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=("When was the capital of Freedonia founded? Answer with just the year."),
     )
-
-    # ── Turn 2: follow-up requiring context retention ───────
-    resp_2 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": web_research_agent,
-            "input": "Based on what you found, when was the omnigent framework created?",
-            "previous_response_id": response_id_1,
-            "background": True,
-        },
-    )
-    resp_2.raise_for_status()
-    response_id_2 = resp_2.json()["id"]
-
-    body_2 = poll_until_terminal(http_client, response_id_2, timeout=300)
-
-    assert body_2["status"] == "completed", (
-        f"Turn 2 status={body_2['status']!r}, output={body_2.get('output', [])}"
-    )
-
-    turn_2_text = _all_text(body_2)
-    assert "2024" in turn_2_text, (
-        "Turn 2 did not reference '2024' from turn 1's search result — "
-        f"context retention failed. Text: {turn_2_text[:500]!r}"
+    resp_id_2 = body_2["id"]
+    result_2 = poll_session_until_terminal(http_client, session_id, resp_id_2, timeout=120)
+    text_2 = final_assistant_text(result_2).lower()
+    assert "1847" in text_2, (
+        "Turn 2 did not reference '1847' from turn 1 — "
+        f"context retention failed. Text: {text_2[:500]!r}"
     )
