@@ -1222,6 +1222,36 @@ _PRERELEASE_FLAG = {
 }
 
 
+def _pip_invocation() -> str:
+    """Return the pip command prefix bound to the running interpreter.
+
+    ``omni upgrade`` shells out to install the new wheel, and a bare
+    ``pip`` is resolved against ``PATH`` — which, in a shell where some
+    *other* environment's ``pip`` shadows the one running ``omni`` (a
+    conda env layered over the venv that actually holds the install,
+    say), targets the wrong environment: it silently upgrades a different
+    copy of omnigent while the running one stays put. ``<sys.executable>
+    -m pip`` pins the upgrade to the interpreter actually running
+    ``omni`` so the new wheel lands where the running CLI lives. Falls
+    back to a bare ``pip`` only when ``sys.executable`` is unknown
+    (frozen / embedded interpreters).
+
+    uv-tool and pipx installs don't need this: they manage per-user tool
+    environments through a global registry, so any ``uv`` / ``pipx`` on
+    ``PATH`` upgrades the same install regardless of the active venv.
+
+    :returns: The pip prefix, e.g. ``"/path/to/.venv/bin/python -m pip"``
+        (the interpreter path shell-quoted so it survives
+        ``shlex.split`` in :func:`_run_upgrade_command`), or ``"pip"``
+        when no interpreter path is available.
+    """
+    import shlex
+
+    if not sys.executable:
+        return "pip"
+    return f"{shlex.quote(sys.executable)} -m pip"
+
+
 def _build_upgrade_suggestion(
     info: _InstalledWheelInfo, *, allow_prerelease: bool = False
 ) -> _UpgradeSuggestion:
@@ -1256,7 +1286,7 @@ def _build_upgrade_suggestion(
             return _UpgradeSuggestion(command=f"pipx reinstall {_DIST_NAME}{pre}", runnable=True)
         if installer in ("pip", None):
             return _UpgradeSuggestion(
-                command=f"pip install --force-reinstall {info.vcs_url}{pre}",
+                command=f"{_pip_invocation()} install --force-reinstall {info.vcs_url}{pre}",
                 runnable=True,
             )
         if installer == "poetry":
@@ -1274,7 +1304,9 @@ def _build_upgrade_suggestion(
     if installer == "pipx":
         return _UpgradeSuggestion(command=f"pipx upgrade {_DIST_NAME}{pre}", runnable=True)
     if installer == "pip":
-        return _UpgradeSuggestion(command=f"pip install -U {_DIST_NAME}{pre}", runnable=True)
+        return _UpgradeSuggestion(
+            command=f"{_pip_invocation()} install -U {_DIST_NAME}{pre}", runnable=True
+        )
     if installer == "poetry":
         return _UpgradeSuggestion(command=f"poetry update {_DIST_NAME}", runnable=True)
     return _UpgradeSuggestion(

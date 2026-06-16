@@ -497,6 +497,7 @@ import sys  # noqa: E402
 from omnigent.update_check import (  # noqa: E402
     _build_upgrade_suggestion,
     _InstalledWheelInfo,
+    _pip_invocation,
     _read_build_info,
     _read_installed_wheel_info,
     _run_installed_wheel_check,
@@ -911,6 +912,52 @@ def test_build_upgrade_suggestion_matrix(
     # to verify the right tool + the right action got picked.
     assert expected_substring in suggestion.command
     assert suggestion.runnable is expected_runnable
+
+
+def test_pip_invocation_pins_to_running_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_pip_invocation`` targets ``sys.executable`` (with a bare fallback).
+
+    Guards the PATH gotcha: a bare ``pip`` resolves against ``PATH`` and can
+    upgrade a *different* environment than the one running ``omni``. Pinning
+    to ``<sys.executable> -m pip`` keeps the upgrade in the running
+    interpreter's environment.
+    """
+    monkeypatch.setattr(sys, "executable", "/opt/venv/bin/python")
+    assert _pip_invocation() == "/opt/venv/bin/python -m pip"
+    # An interpreter path with a space is shell-quoted so it survives the
+    # ``shlex.split`` in ``_run_upgrade_command``.
+    monkeypatch.setattr(sys, "executable", "/Applications/My App/python")
+    assert _pip_invocation() == "'/Applications/My App/python' -m pip"
+    # No interpreter path (frozen / embedded) → bare ``pip`` fallback.
+    monkeypatch.setattr(sys, "executable", "")
+    assert _pip_invocation() == "pip"
+
+
+def test_pip_upgrade_suggestions_use_running_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both pip suggestions (registry + VCS) embed ``<python> -m pip``."""
+    monkeypatch.setattr(sys, "executable", "/opt/venv/bin/python")
+
+    def _info(vcs_url: str | None) -> _InstalledWheelInfo:
+        return _InstalledWheelInfo(
+            install_time_epoch=0.0,
+            installer="pip",
+            vcs_url=vcs_url,
+            commit_sha=None,
+            is_editable=False,
+            package_version="0.1.0",
+            detected_installer="pip",
+        )
+
+    assert (
+        _build_upgrade_suggestion(_info(None)).command
+        == "/opt/venv/bin/python -m pip install -U omnigent"
+    )
+    assert (
+        _build_upgrade_suggestion(_info(_FAKE_GIT_URL)).command
+        == f"/opt/venv/bin/python -m pip install --force-reinstall {_FAKE_GIT_URL}"
+    )
 
 
 def _point_cache_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1345,9 +1392,11 @@ def test_build_upgrade_suggestion_allow_prerelease() -> None:
         _build_upgrade_suggestion(_info("uv"), allow_prerelease=True).command
         == "uv tool upgrade omnigent --prerelease allow"
     )
+    # pip pins the upgrade to the running interpreter (``<python> -m pip``)
+    # so it can't land in some other env whose ``pip`` shadows ours on PATH.
     assert (
         _build_upgrade_suggestion(_info("pip"), allow_prerelease=True).command
-        == "pip install -U omnigent --pre"
+        == f"{_pip_invocation()} install -U omnigent --pre"
     )
     # VCS install carries the flag too.
     assert (
