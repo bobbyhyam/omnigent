@@ -1974,7 +1974,28 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
 # login probe. ``isolated_config`` clears any ambient ``CURSOR_API_KEY``.
 
 
-def test_cursor_set_api_key_paste_writes_block_and_secret(isolated_config) -> None:
+@pytest.fixture()
+def _cursor_sdk_present(monkeypatch):
+    """Force ``cursor-sdk`` detection to report installed.
+
+    The key-management tests below script the Cursor drill-in assuming no
+    install-offer. ``cursor-sdk`` is an opt-in extra (absent in CI), so without
+    this the drill-in's install-offer fires — consuming a scripted menu token
+    (desyncing the input) and even running a real ``uv pip install``. Patching the
+    source-module attribute is seen at every call site (it's resolved at call
+    time). Mirror of :func:`_cursor_sdk_absent`.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.cursor_auth.cursor_sdk_installed",
+        lambda: True,
+    )
+
+
+def test_cursor_set_api_key_paste_writes_block_and_secret(
+    isolated_config, _cursor_sdk_present
+) -> None:
     """Pasting a ``crsr_`` key stores the secret + writes the ``cursor:`` block.
 
     Proves the api-key path: the secret lands in the store (never plaintext in
@@ -1993,7 +2014,9 @@ def test_cursor_set_api_key_paste_writes_block_and_secret(isolated_config) -> No
     assert secrets.load_secret("cursor") == "crsr_test_key_123"
 
 
-def test_cursor_adopt_env_api_key_writes_env_ref(isolated_config, monkeypatch) -> None:
+def test_cursor_adopt_env_api_key_writes_env_ref(
+    isolated_config, monkeypatch, _cursor_sdk_present
+) -> None:
     """Adopting an existing ``$CURSOR_API_KEY`` records an ``env:`` ref only.
 
     The env path must NOT copy the secret into the store — it points the config
@@ -2011,7 +2034,9 @@ def test_cursor_adopt_env_api_key_writes_env_ref(isolated_config, monkeypatch) -
     assert secrets.load_secret("cursor") is None
 
 
-def test_cursor_remove_api_key_drops_block_and_secret(isolated_config) -> None:
+def test_cursor_remove_api_key_drops_block_and_secret(
+    isolated_config, _cursor_sdk_present
+) -> None:
     """Removing a Cursor key deletes the stored secret AND drops the config block."""
     # Seed a stored key: the keychain secret + the ``cursor:`` block referencing it.
     secrets.store_secret("cursor", "crsr_seeded")
@@ -2030,7 +2055,9 @@ def test_cursor_remove_api_key_drops_block_and_secret(isolated_config) -> None:
     assert secrets.load_secret("cursor") is None
 
 
-def test_cursor_set_api_key_non_crsr_declined_is_not_stored(isolated_config) -> None:
+def test_cursor_set_api_key_non_crsr_declined_is_not_stored(
+    isolated_config, _cursor_sdk_present
+) -> None:
     """A non-``crsr_`` paste that the user declines to force is NOT persisted.
 
     The soft prefix check warns and asks to store anyway; declining must leave
