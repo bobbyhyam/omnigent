@@ -37,13 +37,15 @@ def _wait_for_in_progress(
     client: httpx.Client,
     response_id: str,
     timeout: float = 60,
-) -> None:
+) -> bool:
     """Poll until the response transitions to ``in_progress``.
 
     :param client: HTTP client.
     :param response_id: The response ID to poll.
     :param timeout: Max seconds to wait.
-    :raises AssertionError: If not in_progress within timeout.
+    :returns: ``True`` if the response reached ``in_progress``,
+        ``False`` if it jumped straight to a terminal state.
+    :raises AssertionError: If the response never transitions within *timeout*.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -51,9 +53,9 @@ def _wait_for_in_progress(
         body = resp.json()
         status = body.get("status")
         if status == "in_progress":
-            return
+            return True
         if status in ("completed", "failed", "cancelled"):
-            raise AssertionError(f"Response reached terminal state {status} before in_progress")
+            return False
         time.sleep(0.3)
     raise AssertionError(f"Response {response_id} didn't reach in_progress within {timeout}s")
 
