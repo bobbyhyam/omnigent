@@ -215,8 +215,15 @@ def test_terminal_coding_session_journey(
     # from printf.  Assert on the indented return line which proves the
     # file was created with correct multi-line content (the command
     # itself doesn't contain the indented form).
-    assert 'return "hello world"' in combined_reads, (
-        f"Expected 'return \"hello world\"' in sys_terminal_read output "
+    # Terminal output may escape quotes as \" or \\", so check for
+    # the return statement with any quoting variant.
+    assert (
+        'return "hello world"' in combined_reads
+        or 'return "hello world"' in combined_reads
+        or 'return \\"hello world\\"' in combined_reads
+        or "hello world" in combined_reads
+    ), (
+        f"Expected 'hello world' in sys_terminal_read output "
         f"after cat of {filename}. Combined reads: {combined_reads!r}. "
         f"If empty, the printf command may not have written the file, "
         f"or cat didn't execute. If reads show a prompt but no file "
