@@ -46,9 +46,7 @@ def _wait_for_in_progress(
         if body["status"] == "running":
             return
         if body["status"] in ("idle", "failed"):
-            raise AssertionError(
-                f"Session reached terminal state {body['status']} before running"
-            )
+            raise AssertionError(f"Session reached terminal state {body['status']} before running")
         time.sleep(0.3)
     raise AssertionError(f"Session {session_id} didn't reach running within {timeout}s")
 
@@ -120,7 +118,9 @@ def _wait_for_idle(client: httpx.Client, session_id: str, timeout: float = 30) -
         if last_body.get("status") == "failed":
             raise AssertionError(f"Session failed during interrupt teardown: {last_body}")
         time.sleep(0.3)
-    raise AssertionError(f"Session {session_id} did not become idle within {timeout}s: {last_body}")
+    raise AssertionError(
+        f"Session {session_id} did not become idle within {timeout}s: {last_body}"
+    )
 
 
 def test_cancel_appends_history_marker_and_followup_sees_it(
@@ -155,7 +155,7 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id
     )
-    response_id = send_user_message_to_session(
+    send_user_message_to_session(
         http_client,
         session_id=session_id,
         content=(
@@ -234,7 +234,7 @@ def test_cancel_mid_tool_call_followup_succeeds(
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id
     )
-    response_id = send_user_message_to_session(
+    send_user_message_to_session(
         http_client,
         session_id=session_id,
         content=(
