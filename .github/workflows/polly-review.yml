@@ -54,6 +54,9 @@ jobs:
           enable-cache: true
 
       - name: Install bubblewrap
+        # bubblewrap: the linux_bwrap sandbox backend needs bwrap on PATH.
+        # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
+        # that bwrap's unshare(CLONE_NEWUSER) needs; scope is the ephemeral runner.
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap tmux
@@ -86,7 +89,9 @@ jobs:
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: echo "LLM_API_KEY=${LLM_API_KEY}" >> "$GITHUB_ENV"
 
       - name: Write gateway profile (~/.databrickscfg)
         env:
@@ -94,40 +99,52 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
+          # Use python to write the config safely — avoids interpolating
+          # secrets into a heredoc where special chars could break YAML.
+          python3 -c "
+          import pathlib, os
+          cfg = '[default]\nhost  = {host}\ntoken = {token}\n'.format(
+              host=os.environ['GATEWAY_BASE_URL'].removesuffix('/serving-endpoints'),
+              token=os.environ['LLM_API_KEY'],
+          )
+          pathlib.Path.home().joinpath('.databrickscfg').write_text(cfg)
+          "
+          echo "DATABRICKS_BEARER=${LLM_API_KEY}" >> "$GITHUB_ENV"
 
       - name: Write Omnigent provider config
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         run: |
           mkdir -p "$HOME/.omnigent"
-          # The Anthropic Messages surface and the Codex Responses surface live
-          # at different paths off the same workspace host. GATEWAY_BASE_URL is
-          # <host>/serving-endpoints (the OpenAI-compatible surface); strip that
-          # suffix to recover the bare host for the codex /ai-gateway path.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.omnigent/config.yaml" <<EOF
-          providers:
-            databricks-gateway:
-              kind: gateway
-              default: [anthropic, openai]
-              anthropic:
-                base_url: "${GATEWAY_BASE_URL}/anthropic"
-                api_key_ref: "env:LLM_API_KEY"
-                models:
-                  default: databricks-claude-sonnet-4-6
-              openai:
-                base_url: "${host}/ai-gateway/codex/v1"
-                api_key_ref: "env:LLM_API_KEY"
-                wire_api: responses
-                models:
-                  default: databricks-gpt-5-4-mini
-          EOF
+          # Use python to write the config safely — avoids interpolating
+          # secrets/URLs into a heredoc where special chars could break YAML.
+          python3 -c "
+          import pathlib, os, yaml
+          gw = os.environ['GATEWAY_BASE_URL']
+          host = gw.removesuffix('/serving-endpoints')
+          cfg = {
+              'providers': {
+                  'databricks-gateway': {
+                      'kind': 'gateway',
+                      'default': ['anthropic', 'openai'],
+                      'anthropic': {
+                          'base_url': gw + '/anthropic',
+                          'api_key_ref': 'env:LLM_API_KEY',
+                          'models': {'default': 'databricks-claude-sonnet-4-6'},
+                      },
+                      'openai': {
+                          'base_url': host + '/ai-gateway/codex/v1',
+                          'api_key_ref': 'env:LLM_API_KEY',
+                          'wire_api': 'responses',
+                          'models': {'default': 'databricks-gpt-5-4-mini'},
+                      },
+                  }
+              }
+          }
+          pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(
+              yaml.safe_dump(cfg, default_flow_style=False)
+          )
+          "
 
       - name: Collect PR context
         id: ctx
@@ -139,62 +156,50 @@ jobs:
           set -euo pipefail
 
           # Fetch the diff (capped at 64 KB to stay within prompt limits).
-          diff=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff" \
-            | head -c 65536)
+            | head -c 65536 > /tmp/pr_diff.txt
 
-          # Fetch PR metadata.
-          pr_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json title,body,baseRefName,headRefName,additions,deletions,changedFiles)
+          # Fetch PR metadata to separate files — avoids embedding
+          # attacker-controlled strings (PR title/body) into heredocs.
+          gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json title,body,baseRefName,headRefName,additions,deletions,changedFiles \
+            > /tmp/pr_meta.json
 
-          title=$(echo "$pr_json" | jq -r '.title')
-          body=$(echo "$pr_json"  | jq -r '.body // ""' | head -c 4096)
-          base=$(echo "$pr_json"  | jq -r '.baseRefName')
-          head_ref=$(echo "$pr_json"  | jq -r '.headRefName')
-          adds=$(echo "$pr_json"  | jq -r '.additions')
-          dels=$(echo "$pr_json"  | jq -r '.deletions')
-          files=$(echo "$pr_json" | jq -r '.changedFiles')
+          # Build the review prompt safely using python — all untrusted
+          # fields (title, body, diff) are read from files, never
+          # interpolated into shell heredocs.
+          python3 <<'PYEOF'
+          import json, pathlib
 
-          # Build the review prompt and persist to file (avoids shell escaping).
-          cat > /tmp/review_prompt.txt <<PROMPT_EOF
-          Review this pull request and provide structured feedback.
+          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text()
+
+          prompt = f"""Review this pull request and provide structured feedback.
 
           ## PR Metadata
-          - **Title:** ${title}
-          - **Branch:** ${head_ref} → ${base}
-          - **Stats:** +${adds} / -${dels} across ${files} file(s)
+          - **Title:** {meta['title']}
+          - **Branch:** {meta['headRefName']} → {meta['baseRefName']}
+          - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)
 
           ## PR Description
-          ${body}
+          {(meta.get('body') or '')[:4096]}
 
           ## Diff
-          \`\`\`diff
-          ${diff}
-          \`\`\`
-
-          ## Component domains
-          Classify every changed file into one of these domains and organise
-          your feedback accordingly:
-
-          | Label | Scope | Domain experts |
-          |-------|-------|----------------|
-          | comp:core | server routes, runner, store, forwarders, orchestration | core runtime team |
-          | comp:web-ui | ap-web frontend (React/TS), styles, assets | web/frontend team |
-          | comp:sandbox | sandbox policies, bubblewrap, isolation | core runtime team (sandbox specialists) |
-          | comp:sdk | SDK clients, harness adapters, inner executors | SDK team |
-          | comp:cli | CLI entrypoints, argument parsing | CLI owners |
-          | comp:ci | GitHub Actions workflows, CI scripts | infra team |
-          | comp:docs | docs, README, API.md, changelogs | rotates across all teams |
+          ```diff
+          {diff}
+          ```
 
           ## Instructions
-          Review the diff against the PR description. For each domain that has
-          changes, report:
+          Review the diff against the PR description. Report:
           1. **Blocking issues** — bugs, security problems, correctness errors, data loss risks.
           2. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
+          3. **Summary** — one-paragraph overall assessment.
 
-          End with a short **Summary** — one-paragraph overall assessment.
           Be concise. Do not restate the diff. Focus on what matters.
-          PROMPT_EOF
+          """
+          pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
+          PYEOF
 
       - name: Run Polly review
         id: polly
@@ -215,9 +220,13 @@ jobs:
             | tee /tmp/polly_output.txt \
             || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
 
-          echo "review_text<<REVIEW_EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
-          echo "REVIEW_EOF" >> "$GITHUB_OUTPUT"
+          # Use a collision-resistant random delimiter so model output
+          # containing "REVIEW_EOF" cannot truncate the output.
+          delim="REVIEW_$(openssl rand -hex 8)"
+          echo "review_text<<${delim}" >> "$GITHUB_OUTPUT"
+          # Cap at 60 KB — GitHub comment body limit is ~65 KB.
+          head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
+          echo "${delim}" >> "$GITHUB_OUTPUT"
 
       - name: Post review comment
         if: steps.polly.outputs.review_text != ''
@@ -225,21 +234,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
 
-          cat > /tmp/comment.md <<'COMMENT_EOF'
-          ## Polly AI Review
-
-          COMMENT_EOF
-
-          echo "${{ steps.polly.outputs.review_text }}" >> /tmp/comment.md
-
-          cat >> /tmp/comment.md <<'COMMENT_EOF'
-
-          ---
-          <sub>Automated review by Polly · [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>
-          COMMENT_EOF
+          # Build the comment body safely — REVIEW_TEXT is passed via env
+          # (not ${{ }} interpolation) to avoid expression injection.
+          {
+            echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
+            echo ""
+            echo "$REVIEW_TEXT"
+            echo ""
+            echo "---"
+            echo "<sub>Automated review by Polly · [workflow run](${RUN_URL})</sub>"
+          } > /tmp/comment.md
 
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
 
