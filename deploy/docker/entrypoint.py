@@ -39,7 +39,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -61,6 +61,17 @@ _DEFAULT_ARTIFACT_DIR = "/data/artifacts"
 
 @dataclass(frozen=True)
 class _ResolvedConfig:
+    """Configuration resolved before migrations and app construction."""
+
+    cfg: dict[str, Any]
+    database_url: str
+    artifact_dir: Path
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class _BuiltApp:
     """The bind address resolved alongside the built app.
 
     ``build_app`` resolves HOST/PORT as a side effect of wiring the app
@@ -92,17 +103,12 @@ def run_migrations(database_url: str) -> None:
         migration_engine.dispose()
 
 
-def build_app() -> _ResolvedConfig:
-    """Load config, run migrations, wire the stores, and build the app.
+def _resolve_config() -> _ResolvedConfig:
+    """Load config and resolve startup settings before migrations run."""
 
-    This is the entire boot sequence formerly run at import time, in the
-    same order: config → migrations → stores → ``create_app``. Returns
-    the built app plus the resolved bind host/port for ``uvicorn.run``.
-    """
     from omnigent.db.utils import normalize_database_url
-    from omnigent.server.app import create_app
     from omnigent.server.paas_env import detect_base_url, resolve_bind_host
-    from omnigent.server.server_config import config_str_list, load_server_config
+    from omnigent.server.server_config import load_server_config
 
     # ── Configuration ────────────────────────────────────────
     # Non-secret settings come from a YAML config file (default
@@ -197,10 +203,30 @@ def build_app() -> _ResolvedConfig:
                 os.environ, host=host, port=port
             )
 
-    # ── Migrations ───────────────────────────────────────────
-    # Alembic upgrade runs before the stores boot — the SQLAlchemy
-    # stores refuse to start on a stale schema.
-    run_migrations(database_url)
+    return _ResolvedConfig(
+        cfg=cfg,
+        database_url=database_url,
+        artifact_dir=artifact_dir,
+        host=host,
+        port=port,
+    )
+
+
+def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
+    """Resolve config if needed, wire the stores, and build the app.
+
+    This function intentionally does not run migrations; ``main()`` runs
+    them explicitly after config resolution and before store construction.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.server.server_config import config_str_list
+
+    if resolved_config is None:
+        resolved_config = _resolve_config()
+
+    cfg = resolved_config.cfg
+    database_url = resolved_config.database_url
+    artifact_dir = resolved_config.artifact_dir
 
     # ── Stores ───────────────────────────────────────────────
 
@@ -287,7 +313,7 @@ def build_app() -> _ResolvedConfig:
         sandbox_config=sandbox_config,
     )
 
-    return _ResolvedConfig(app=app, host=host, port=port)
+    return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
 
 
 def main() -> None:
@@ -299,13 +325,20 @@ def main() -> None:
     non-zero — the orchestrator then restarts us.
     """
     try:
+        resolved_config = _resolve_config()
+
+        # ── Migrations ───────────────────────────────────────────
+        # Alembic upgrade runs before the stores boot — the SQLAlchemy
+        # stores refuse to start on a stale schema.
+        run_migrations(resolved_config.database_url)
+
+        resolved = build_app(resolved_config)
+
         import uvicorn
 
         from omnigent.runner.transports.ws_tunnel.limits import (
             RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
         )
-
-        resolved = build_app()
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
         uvicorn.run(
@@ -318,7 +351,7 @@ def main() -> None:
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
         # Keep the process alive briefly so the container log capture has time
         # to flush before the orchestrator restarts us.
-        import time
+        import time  # deferred — keeps module inert
 
         time.sleep(30)
         sys.exit(1)
