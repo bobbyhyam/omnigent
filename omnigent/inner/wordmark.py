@@ -1,9 +1,9 @@
 """The Omnigent brand wordmark and Otto lockup for CLI output.
 
-A bold "ANSI-Shadow" block-letter ``omnigent`` wordmark — compacted to
-four rows (top cap · identity · bottom · drop-shadow) so it sits near
-header height while keeping every letter legible — paired with the
-Otto-the-starfish mascot from :mod:`omnigent.inner.mascots`.
+A bold "ANSI-Shadow" block-letter ``omnigent`` wordmark — the canonical
+figlet font with one duplicate body row dropped (5 rows), so every letter
+stays legible and it sits exactly as tall as the Otto-the-starfish mascot
+from :mod:`omnigent.inner.mascots`, which it pairs with 1:1.
 
 This module owns the *art* and its rendering onto a caller-supplied
 :class:`rich.console.Console`. The decision of *whether* to draw the
@@ -41,23 +41,23 @@ _GAP = "  "
 # terminal edge (matches the installer's two-space banner indent).
 _INDENT = "  "
 
-# Per-letter 4-row "ANSI-Shadow" glyphs (top cap · identity row · bottom ·
-# drop-shadow), compacted from the canonical 6-row figlet font by keeping
-# each letter's distinguishing middle row — so ``g`` and ``e`` stay legible
-# — while dropping the two near-duplicate body rows for a header-height
-# wordmark. Stored as a glyph map rather than a frozen multi-line blob so
-# the wordmark is regenerable and a missing letter fails loud at import.
-# Each glyph's four rows are equal display width so columns stay aligned
-# when letters are concatenated.
-_GLYPH_ROWS = 4
-_GLYPHS: dict[str, tuple[str, str, str, str]] = {
-    "o": (" ██████╗ ", "██║   ██║", "╚██████╔╝", " ╚═════╝ "),
-    "m": ("███╗   ███╗", "██╔████╔██║", "██║ ╚═╝ ██║", "╚═╝     ╚═╝"),
-    "n": ("███╗   ██╗", "██╔██╗ ██║", "██║ ╚████║", "╚═╝  ╚═══╝"),
-    "i": ("██╗", "██║", "██║", "╚═╝"),
-    "g": (" ██████╗ ", "██║  ███╗", "╚██████╔╝", " ╚═════╝ "),
-    "e": ("███████╗", "█████╗  ", "███████╗", "╚══════╝"),
-    "t": ("████████╗", "   ██║   ", "   ██║   ", "   ╚═╝   "),
+# Per-letter "ANSI-Shadow" glyphs — the canonical figlet font (as used by
+# NeonX and TAAG) with a single near-duplicate body row dropped, leaving 5
+# rows. This keeps the full-height, fully-legible letterforms while sitting
+# exactly as tall as Otto (5 rows), so the lockup pairs 1:1 with no unpaired
+# rows. Stored as a glyph map rather than a frozen multi-line blob so the
+# wordmark is regenerable and a missing letter fails loud at import. Each
+# glyph's rows are equal display width so columns stay aligned when letters
+# are concatenated.
+_GLYPH_ROWS = 5
+_GLYPHS: dict[str, tuple[str, ...]] = {
+    "o": (" ██████╗ ", "██╔═══██╗", "██║   ██║", "╚██████╔╝", " ╚═════╝ "),
+    "m": ("███╗   ███╗", "████╗ ████║", "██╔████╔██║", "██║ ╚═╝ ██║", "╚═╝     ╚═╝"),
+    "n": ("███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║ ╚████║", "╚═╝  ╚═══╝"),
+    "i": ("██╗", "██║", "██║", "██║", "╚═╝"),
+    "g": (" ██████╗ ", "██╔════╝ ", "██║  ███╗", "╚██████╔╝", " ╚═════╝ "),
+    "e": ("███████╗", "██╔════╝", "█████╗  ", "███████╗", "╚══════╝"),
+    "t": ("████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ╚═╝   "),
 }
 
 _WORDMARK_TEXT = "omnigent"
@@ -82,10 +82,9 @@ def _build_wordmark(word: str) -> tuple[str, ...]:
 #: The rows of the ``omnigent`` wordmark, as plain (uncolored) text.
 WORDMARK_LINES: tuple[str, ...] = _build_wordmark(_WORDMARK_TEXT)
 
-# Which Otto row each wordmark row sits on. Otto is five rows tall and the
-# wordmark four, so the wordmark sits on Otto rows 1–4 — its drop-shadow
-# row lands on Otto's feet (grounded) and Otto's top point peeks above.
-_WORDMARK_ROW_FOR_OTTO_ROW = {1: 0, 2: 1, 3: 2, 4: 3}
+# Which Otto row each wordmark row sits on. Otto and the wordmark are both
+# five rows tall, so they pair 1:1 — no unpaired rows on either side.
+_WORDMARK_ROW_FOR_OTTO_ROW = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4}
 
 
 def wordmark_lines() -> list[str]:
@@ -103,8 +102,8 @@ def lockup_lines() -> list[str]:
     Return the Otto + wordmark lockup as plain text rows (no color).
 
     Otto sits on the left (5 rows × :data:`MASCOT_ART_COL_WIDTH` cells)
-    with the 4-row wordmark against it. Trailing whitespace is stripped
-    so the plain form is clean for snapshots and docs.
+    with the 5-row wordmark aligned 1:1 beside it. Trailing whitespace is
+    stripped so the plain form is clean for snapshots and docs.
 
     :returns: Five rows of the composed lockup.
     """

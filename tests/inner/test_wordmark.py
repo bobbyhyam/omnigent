@@ -9,10 +9,10 @@ from omnigent.inner import wordmark
 from omnigent.inner.mascots import MASCOT_ART_COLOR, MASCOT_ART_LINES
 
 
-def test_wordmark_is_four_rows_of_equal_display_width() -> None:
-    """The wordmark renders as four columns-aligned rows."""
+def test_wordmark_is_five_rows_of_equal_display_width() -> None:
+    """The wordmark renders as five columns-aligned rows (Otto's height)."""
 
-    assert len(wordmark.WORDMARK_LINES) == 4
+    assert len(wordmark.WORDMARK_LINES) == 5
     widths = {cell_len(line) for line in wordmark.WORDMARK_LINES}
     assert len(widths) == 1, f"wordmark rows misaligned: {widths}"
 
@@ -33,13 +33,14 @@ def test_every_letter_in_omnigent_has_a_glyph() -> None:
 
 
 def test_lockup_lines_pair_otto_with_wordmark() -> None:
-    """The lockup is Otto (5 rows) with the 4-row wordmark on rows 1–4."""
+    """The lockup is Otto (5 rows) with the 5-row wordmark aligned 1:1."""
 
     lines = wordmark.lockup_lines()
     assert len(lines) == len(MASCOT_ART_LINES) == 5
-    # Row 0 is Otto-only (its top point); rows 1–4 carry the wordmark blocks.
-    assert "█" not in lines[0]
-    assert "█" in lines[1]
+    # Every row pairs Otto with a wordmark row; the cap and body rows carry
+    # block glyphs (the final row is the all-line-art drop shadow).
+    assert "█" in lines[0]
+    assert "█" in lines[2]
     # Plain text form carries no ANSI escapes.
     assert all("\x1b[" not in line for line in lines)
 
