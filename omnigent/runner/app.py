@@ -2956,12 +2956,30 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
 
 
-# Match the language constant the omnigent YAML translator stamps on
-# callable-backed tools (omnigent/spec/omnigent.py:OMNIGENT_TOOL_LANGUAGE).
-# Duplicated rather than imported to avoid pulling the heavy translator
-# module in for one string — same rationale as
-# omnigent/tools/local_callable.py.
+# Language constant the omnigent YAML translator stamps on callable-backed
+# tools (omnigent/spec/omnigent.py:OMNIGENT_TOOL_LANGUAGE). Duplicated rather
+# than imported to avoid pulling the heavy translator module in for one
+# string — same rationale as omnigent/tools/local_callable.py.
 _OMNIGENT_CALLABLE_LANGUAGE = "omnigent-python-callable"
+
+
+def _looks_like_file_path(path: str) -> bool:
+    """
+    Return whether *path* is a filesystem path rather than a dotted import.
+
+    File-based local tools are discovered as ``tools/python/foo.py`` /
+    ``tools/typescript/foo.ts`` — always carrying a path separator and a
+    source extension (see :func:`omnigent.spec.parser._discover_local_tools`).
+    Callable-backed tools store a dotted import path (``pkg.mod.func``) in the
+    same field — no separator, no source extension. This structural test is
+    the primary guard so a rename of the callable-tool *language* string can
+    never reintroduce the workdir-mangling bug.
+
+    :param path: A :class:`LocalToolInfo` ``path`` value.
+    :returns: ``True`` when *path* is a file path safe to resolve onto the
+        workdir; ``False`` for dotted import paths.
+    """
+    return "/" in path or os.sep in path or path.endswith((".py", ".ts"))
 
 
 def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
@@ -2974,15 +2992,16 @@ def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     changed = False
     for info in local_tools:
         path = getattr(info, "path", None)
-        # Only file-based local tools carry a workdir-relative path
-        # (e.g. ``tools/python/foo.py``). Callable-backed tools store a
-        # dotted import path (``pkg.mod.func``) in the same field; joining
-        # that to the workdir corrupts it into a bogus filesystem path, the
-        # import fails, the tool never registers, and any tool_call policy
-        # narrowed to it can never fire.
+        # Only resolve genuine file paths onto the workdir. Callable-backed
+        # tools store a dotted import path (``pkg.mod.func``) in the same
+        # field; joining that to the workdir corrupts it, the import fails,
+        # the tool never registers, and any tool_call policy narrowed to it
+        # can never fire. The structural file-vs-dotted check is the primary
+        # guard; the language check is belt-and-suspenders.
         if (
             path
             and getattr(info, "language", None) != _OMNIGENT_CALLABLE_LANGUAGE
+            and _looks_like_file_path(path)
             and not Path(path).is_absolute()
         ):
             resolved_tools.append(dataclasses.replace(info, path=str((workdir / path).resolve())))

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from omnigent.runner.app import _spec_with_workdir_paths
 from omnigent.spec.types import AgentSpec, LocalToolInfo
 
@@ -82,3 +84,30 @@ def test_absolute_path_left_untouched(tmp_path: Path) -> None:
     resolved = _spec_with_workdir_paths(spec, tmp_path)
 
     assert resolved.local_tools[0].path == "/abs/tools/python/arxiv_search.py"
+
+
+@pytest.mark.parametrize("language", ["omnigent-python-callable", "python", None])
+def test_dotted_path_untouched_regardless_of_language(
+    tmp_path: Path, language: str | None
+) -> None:
+    """A dotted import path survives even if its language field is wrong.
+
+    The structural file-vs-dotted discriminator must win over the language
+    string so a translator rename of the callable-tool language can't
+    silently reintroduce the workdir-mangling bug.
+    """
+    spec = _spec_with_tools(
+        [
+            LocalToolInfo(
+                name="calculate",
+                path="tests.resources.examples._shared.tool_functions.calculate",
+                language=language,  # type: ignore[arg-type]
+            )
+        ]
+    )
+
+    resolved = _spec_with_workdir_paths(spec, tmp_path)
+
+    assert resolved.local_tools[0].path == (
+        "tests.resources.examples._shared.tool_functions.calculate"
+    )

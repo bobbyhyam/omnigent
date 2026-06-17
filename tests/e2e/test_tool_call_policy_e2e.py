@@ -96,9 +96,7 @@ def test_tool_call_deny_blocks_callable_tool(
                 "calculate": {
                     "type": "function",
                     "description": "Evaluate a math expression.",
-                    "callable": (
-                        "tests.resources.examples._shared.tool_functions.calculate"
-                    ),
+                    "callable": ("tests.resources.examples._shared.tool_functions.calculate"),
                 },
             },
             "policies": {
@@ -146,12 +144,11 @@ def test_tool_call_deny_blocks_callable_tool(
     )
 
     assert body.get("status") == "completed", (
-        f"turn did not complete cleanly: status={body.get('status')!r} "
-        f"error={body.get('error')!r}"
+        f"turn did not complete cleanly: status={body.get('status')!r} error={body.get('error')!r}"
     )
 
     outs = _tool_outputs(body)
-    assert any(_DENY_REASON in o or "Denied by policy" in o for o in outs), (
+    assert any(_DENY_REASON in o for o in outs), (
         f"DENY sentinel missing from tool outputs — the tool_call policy "
         f"did not fire (tool may have failed to register).\n"
         f"tool outputs: {outs}\ntext: {_all_text(body)}"
