@@ -2,6 +2,7 @@ import { BotIcon } from "lucide-react";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
+import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import type { ComponentType, SVGProps } from "react";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -25,6 +26,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
+  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
