@@ -59,14 +59,21 @@ _NATIVE_TURN_TIMEOUT_MS = 180_000
 # ExitPlanMode. Combined with the fixture's ``--disallowedTools
 # AskUserQuestion`` (native_claude_plan_session), this keeps the model on the
 # ExitPlanMode path the review card under test depends on.
+#
+# The pinned file/comment only have to be *plausible* targets for a plan: Claude
+# is planning, never executing (the test never approves an edit), so the run is
+# unaffected even if ``README.md`` is later renamed or removed from the repo
+# root. The constant just keeps the prompt's intent explicit.
+_PLAN_FILE = "README.md"
+_PLAN_COMMENT = "<!-- Maintained by the Platform team -->"
 _PLAN_PROMPT = (
     "You are in plan mode. Put together a short plan describing how you would "
-    "add the one-line comment `<!-- Maintained by the Platform team -->` as the "
-    "final line of `README.md` in this repository. Do not ask any clarifying "
-    "questions; if any detail is unspecified, assume a reasonable default and "
-    "proceed. Then immediately use the ExitPlanMode tool to present that plan "
-    "for my approval. Keep the plan to a few bullet points and do not make any "
-    "edits yet."
+    f"add the one-line comment `{_PLAN_COMMENT}` as the final line of "
+    f"`{_PLAN_FILE}` in this repository. Do not ask any clarifying questions; "
+    "if any detail is unspecified, assume a reasonable default and proceed. "
+    "Then immediately use the ExitPlanMode tool to present that plan for my "
+    "approval. Keep the plan to a few bullet points and do not make any edits "
+    "yet."
 )
 
 
