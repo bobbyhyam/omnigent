@@ -118,9 +118,7 @@ async def test_cursor_resume_without_live_terminal_is_marked_as_cold_resume(
     assert prepared.reattached is False
     assert prepared.cold_resumed is True
     assert prepared.terminal_id == "terminal_cursor_main"
-    assert fake.patch_calls == [
-        ("/v1/sessions/conv_cursor", {"terminal_launch_args": ["-f"]})
-    ]
+    assert fake.patch_calls == [("/v1/sessions/conv_cursor", {"terminal_launch_args": ["-f"]})]
     assert fake.post_calls == [
         (
             "/v1/sessions/conv_cursor/resources/terminals",
