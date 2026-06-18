@@ -106,6 +106,13 @@ jobs:
       - name: Check out scripts
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          # Trusted gate scripts from main, never the PR head: on the
+          # pull_request (automerge) event the default ref is
+          # refs/pull/N/merge and on check_suite it is the suite head SHA,
+          # so an unpinned checkout would source the PR's own required.sh /
+          # evaluate-checks.sh -- a stale REQUIRED list (e.g. predating E2E)
+          # or an edited gate would then decide the merge. Pin to main.
+          ref: main
           sparse-checkout: .github/scripts/merge-ready
           persist-credentials: false
 
