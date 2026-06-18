@@ -2736,6 +2736,75 @@ def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
     assert "--extension" in spawn_line
 
 
+def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog) -> None:
+    """The normal ``PiExecutor.run_turn`` path must pass the system prompt to
+    Pi without leaking it into the spawn debug log.
+
+    This drives the real executor wiring from ``run_turn`` through
+    ``_ensure_rpc`` and ``_PiRpcSession.start`` with only subprocess creation
+    stubbed, so it catches regressions at the behavior boundary users hit.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log-capture fixture.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    test_prompt = "END-TO-END-SYSTEM-PROMPT-LEAK-SENTINEL-67890"
+    captured: dict[str, list[str]] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["argv"] = list(args)
+        return _FakeProcess(
+            stdout_lines=[
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "hi"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ],
+            stderr_lines=[],
+        )
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        executor = PiExecutor(pi_path="/usr/bin/pi")
+        try:
+            return [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    test_prompt,
+                )
+            ]
+        finally:
+            await executor.close()
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.inner.pi_executor"):
+        events = _run(_test())
+
+    turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_complete) == 1
+    assert turn_complete[0].response == "hi"
+
+    argv = captured["argv"]
+    assert "--append-system-prompt" in argv
+    assert argv[argv.index("--append-system-prompt") + 1] == test_prompt
+
+    spawn_logs = [r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()]
+    assert spawn_logs, "expected a 'PiExecutor: spawning' debug log line"
+    spawn_line = spawn_logs[0]
+
+    assert test_prompt not in spawn_line
+    assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
+    assert "--append-system-prompt" in spawn_line
+    assert "--mode" in spawn_line
+
+
 def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
     """A host secret seeded in ``os.environ`` never reaches the spawned
     Pi process through the full real path (reproduces the leak PoC).
