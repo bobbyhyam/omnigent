@@ -2248,12 +2248,29 @@ async def _query_sessions_once(
         if reconciled is not None:
             return reconciled
         raise
+    all_text_parts: list[str] = []
     if result.text:
-        return result.text
-    reconciled = await _persisted_turn_text(client, bound.id)
-    if reconciled is not None:
-        return reconciled
-    # No assistant text for this turn. If the runner persisted a terminal
+        all_text_parts.append(result.text)
+    elif (reconciled := await _persisted_turn_text(client, bound.id)) is not None:
+        all_text_parts.append(reconciled)
+
+    # Multi-turn loop for async orchestrators (e.g. polly) that dispatch
+    # sub-agents and are auto-woken by inbox completions across multiple
+    # turns. Each iteration subscribes to the live stream and collects
+    # the next auto-triggered turn. The loop exits when the session
+    # becomes idle (no pending sub-agents) or the turn limit is hit.
+    _MAX_EXTRA_TURNS = 30
+    for _ in range(_MAX_EXTRA_TURNS):
+        await chat.refresh()
+        if chat.status not in ("waiting", "running", "launching"):
+            break
+        extra = await chat.await_turn()
+        if extra.text:
+            all_text_parts.append(extra.text)
+
+    if all_text_parts:
+        return "".join(all_text_parts)
+    # No assistant text at all. If the runner persisted a terminal
     # ``error`` item (e.g. a harness start failure like the cursor SDK's
     # invalid-model rejection), surface it instead of returning ``None`` —
     # otherwise the headless caller renders a failed turn as a silent,
