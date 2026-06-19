@@ -221,7 +221,12 @@ def test_polly_dispatches_distinct_models_per_worker(
     from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
     reset_mock_llm(mock_llm_server_url)
-    polly_dir = _mock_polly_spec_dir(tmp_path, mock_llm_server_url)
+    # rewrite_sub_agent_harnesses=True replaces native CLI harnesses (``pi``,
+    # ``codex-native``, ``claude-native``) with ``openai-agents`` so child
+    # sessions are created even when the binaries are absent (e.g. on CI).
+    polly_dir = _mock_polly_spec_dir(
+        tmp_path, mock_llm_server_url, rewrite_sub_agent_harnesses=True
+    )
     tag = uuid.uuid4().hex[:8]
 
     # First mock response: emit three sys_session_send tool calls — one per
@@ -554,7 +559,12 @@ def test_polly_canonical_id_localized_for_gateway_child(
     from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
     reset_mock_llm(mock_llm_server_url)
-    polly_dir = _mock_polly_spec_dir(tmp_path, mock_llm_server_url)
+    # rewrite_sub_agent_harnesses=True replaces the native ``pi`` harness
+    # (which needs the ``pi`` binary on PATH) with ``openai-agents`` so the
+    # child session is created even when the binary is absent — e.g. on CI.
+    polly_dir = _mock_polly_spec_dir(
+        tmp_path, mock_llm_server_url, rewrite_sub_agent_harnesses=True
+    )
     tag = uuid.uuid4().hex[:8]
 
     configure_mock_llm(
