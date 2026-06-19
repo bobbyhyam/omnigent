@@ -84,22 +84,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             item.add_marker(marker)
         return
-    # Gate ``mock_only`` tests out of the real-LLM Integration jobs. The
-    # only correct signal for "mock mode" is the absence of a real
-    # ``--llm-api-key`` (``_is_mock_mode`` / the ``using_mock_llm``
-    # fixture). The ``mock_llm_server_url`` fixture is "always started
-    # regardless of --llm-api-key" so a ``mock_llm_server_url is None``
-    # guard inside a test is dead code that never skips. Scripted
-    # tool-call tests (fixed mock queue) cannot run against a real LLM,
-    # which would 401 on the mock base URL or fail the scripted-marker
-    # assertions; skip them centrally here instead.
-    if not _is_mock_mode(config):
-        skip_mock_only = pytest.mark.skip(
-            reason="mock_only test: requires mock-LLM mode (no --llm-api-key)"
-        )
-        for item in items:
-            if item.get_closest_marker("mock_only") is not None:
-                item.add_marker(skip_mock_only)
     if config.getoption("--harness") == "codex":
         for item in items:
             item.add_marker(pytest.mark.flaky(reruns=2, reruns_delay=5))
