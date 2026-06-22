@@ -98,12 +98,7 @@ export function InboxPage() {
   // server; persistent failures surface in the error banner below.
   const snapshotQueries = useQueries({
     queries: rows.map((row) => ({
-      queryKey: [
-        "inbox-elicitations",
-        row.id,
-        row.pending_elicitations_count,
-        row.updated_at,
-      ],
+      queryKey: ["inbox-elicitations", row.id, row.pending_elicitations_count, row.updated_at],
       queryFn: () => getSession(row.id),
       retry: 1,
     })),
