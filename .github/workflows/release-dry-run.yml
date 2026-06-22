@@ -1,9 +1,30 @@
-# Nightly release dry-run: build the three version-locked distributions
-# (omnigent core wheel + omnigent-client + omnigent-ui-sdk) and run the release
-# gates WITHOUT publishing, to catch packaging regressions before release day.
-# Mirrors release-omnigent.yml minus publish. Does NOT cover the secure-repo
-# dependency scan / OIDC publishing (databricks/secure-public-registry-releases-eng).
-# Cron targets main; "Run workflow" can pick a release branch / RC tag.
+# Nightly release dry-run: build the three version-locked omnigent
+# distributions (omnigent core wheel + omnigent-client + omnigent-ui-sdk) and
+# run the release gates WITHOUT publishing, to catch packaging regressions
+# before release day. Cron targets main; "Run workflow" can pick a release
+# branch / RC tag.
+#
+# This deliberately MIRRORS the build + gates of the real release workflow
+# (databricks/secure-public-registry-releases-eng → `omnigent.yml`): same
+# `python -m build` toolchain, per-package dist dirs, lockstep version/pin
+# gate, `twine check --strict`, web-UI-in-wheel gate, and smoke-install. Keep
+# the two in sync when either changes.
+#
+# ⚠️ A GREEN RUN HERE DOES NOT GUARANTEE THE RELEASE WILL SUCCEED. The real
+# release does several things this dry-run structurally CANNOT, so it can pass
+# here and still fail there:
+#   • Dependencies resolve from PUBLIC pypi.org / npm here, but from the JFrog
+#     mirror in the secure repo — a package available publicly yet missing or
+#     blocked in JFrog passes here and fails the real release.
+#   • No dependency scan (the secure repo runs `databricks/gh-action-scan` over
+#     every wheel; that tooling is internal-only).
+#   • No publish step / OIDC Trusted Publishing / per-package `pypi-<name>`
+#     environments, and no hardened runner group or actor check.
+#   • The tag↔commit identity check is weaker: we tag and build the SAME repo,
+#     so we only assert ref == v<version> (below); the secure prod gate also
+#     verifies the tag points at the built commit in omnigent-ai/omnigent.
+# Closing the JFrog/scan gaps would require a cross-org dispatch into the
+# secure workflow (dry-run=true) with a stored token + security sign-off.
 name: Release dry-run
 
 on:
@@ -13,6 +34,10 @@ on:
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 concurrency:
   group: release-dry-run-${{ github.ref }}
@@ -28,94 +53,135 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
-          enable-cache: false
-
-      - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
-      # Build the web UI into the package tree first — the wheel packages it.
-      - name: Build web UI
+      - name: Install build tools
+        run: pip install build twine packaging
+
+      # GATE: all three packages carry one identical version, and each
+      # cross-package dependency is an exact `==<version>` pin (lockstep
+      # contract). Checked on every run. Mirrors the secure repo's gate.
+      - name: Verify lockstep versions and pins
+        id: gate
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import sys, tomllib
+
+          specs = {
+              "pyproject.toml": ("omnigent-client", "omnigent-ui-sdk"),
+              "sdks/python-client/pyproject.toml": ("omnigent",),
+              "sdks/ui/pyproject.toml": ("omnigent-client",),
+          }
+          projects, versions, errors = {}, {}, []
+          for path in specs:
+              with open(path, "rb") as f:
+                  projects[path] = tomllib.load(f)["project"]
+              versions[projects[path]["name"]] = projects[path]["version"]
+              print(f"{path}: {projects[path]['name']}=={projects[path]['version']}", file=sys.stderr)
+
+          if len(set(versions.values())) != 1:
+              errors.append(f"package versions differ: {versions}")
+          version = projects["pyproject.toml"]["version"]
+          for path, siblings in specs.items():
+              deps = projects[path].get("dependencies", [])
+              for name in siblings:
+                  pin = f"{name}=={version}"
+                  if pin not in deps:
+                      errors.append(f"{path} dependencies missing exact pin {pin!r}")
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}", file=sys.stderr)
+              sys.exit(1)
+          print(f"version={version}")
+          PY
+
+      # GATE (tag dispatch only): the dispatched tag must be `v<version>`. The
+      # secure prod gate additionally verifies the tag's commit; we build the
+      # same repo we tag, so that part is N/A here.
+      - name: Verify tag matches version
+        if: github.ref_type == 'tag'
+        env:
+          REF: ${{ github.ref_name }}
+          VERSION: ${{ steps.gate.outputs.version }}
+        run: |
+          expected="v${VERSION}"
+          if [[ "$REF" != "$expected" ]]; then
+            echo "ERROR: tag ref '${REF}' must be the version tag '${expected}'."
+            exit 1
+          fi
+          echo "Verified: ${REF} matches package version."
+
+      # Build the web UI into the core package tree FIRST — the core wheel
+      # packages whatever is on disk. `--legacy-peer-deps` matches how ap-web's
+      # lockfile is generated/validated everywhere (React 19 peer conflict).
+      - name: Build web UI (clean)
         run: |
           rm -rf omnigent/server/static/web-ui
           npm --prefix ap-web ci --legacy-peer-deps
           npm --prefix ap-web run build
 
-      # All three packages share one version; cross-package deps are exact `==`
-      # pins. On a tag ref, also require version == tag.
-      - name: Verify lockstep versions and pins
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+      # Per-package dist dirs, matching the secure repo (its publish matrix
+      # uploads each separately). Core is setuptools; the SDKs are hatchling.
+      - name: Build distributions
         run: |
-          uv run --no-project python - <<'PY'
-          import os, sys, tomllib
-          packages = {
-              "pyproject.toml": ("omnigent-client", "omnigent-ui-sdk"),
-              "sdks/python-client/pyproject.toml": ("omnigent",),
-              "sdks/ui/pyproject.toml": ("omnigent-client",),
-          }
-          errors, versions = [], {}
-          for path, sibling_pins in packages.items():
-              with open(path, "rb") as f:
-                  project = tomllib.load(f)["project"]
-              versions[path] = project["version"]
-              print(f"{path}: version={project['version']}")
-              for name in sibling_pins:
-                  pin = f"{name}=={project['version']}"
-                  if pin not in project["dependencies"]:
-                      errors.append(f"{path} missing exact pin {pin!r}")
-          if len(set(versions.values())) != 1:
-              errors.append(f"versions are not lockstep: {versions}")
-          if os.environ.get("REF_TYPE") == "tag":
-              tag = os.environ["REF_NAME"].removeprefix("v")
-              for path, version in versions.items():
-                  if version != tag:
-                      errors.append(f"{path} version {version} != tag v{tag}")
-          for e in errors:
-              print(f"::error::{e}")
-          sys.exit(1 if errors else 0)
-          PY
-
-      - name: Build sdists + wheels
-        run: |
-          uv build --out-dir dist
-          uv build sdks/python-client --out-dir dist
-          uv build sdks/ui --out-dir dist
-          ls -la dist/
+          python -m build --outdir dist-omnigent .
+          python -m build --outdir dist-omnigent-client sdks/python-client
+          python -m build --outdir dist-omnigent-ui-sdk sdks/ui
+          ls -la dist-omnigent dist-omnigent-client dist-omnigent-ui-sdk
 
       - name: twine check
-        run: uvx twine check dist/*
+        run: twine check --strict dist-omnigent/* dist-omnigent-client/* dist-omnigent-ui-sdk/*
 
-      - name: Assert web-UI bundle shipped in the wheel
+      # GATE: the built UI bundle must be inside the core wheel — catches a
+      # "wheel shipped with no UI" that twine check cannot see.
+      - name: Assert web-UI bundle shipped in the core wheel
         run: |
-          uv run --no-project python - <<'PY'
+          python - <<'PY'
           import glob, sys, zipfile
-          whls = sorted(glob.glob("dist/omnigent-*.whl"))
+          whls = sorted(glob.glob("dist-omnigent/omnigent-*.whl"))
           if not whls:
-              sys.exit("no core omnigent wheel found in dist/")
+              sys.exit("no core omnigent wheel found in dist-omnigent/")
           names = zipfile.ZipFile(whls[-1]).namelist()
           ui = [n for n in names if "server/static/web-ui/" in n]
           has_index = any(n.endswith("server/static/web-ui/index.html") for n in ui)
-          print(f"{whls[-1]}: {len(ui)} web-ui files, index.html = {has_index}")
+          print(f"{whls[-1]}: {len(ui)} web-ui files, index.html present = {has_index}")
           sys.exit(0 if (ui and has_index) else "WEB-UI BUNDLE MISSING FROM WHEEL")
           PY
 
+      # GATE: the three wheels install together and the CLI entry point imports.
       - name: Smoke-install the built wheels
         run: |
-          uv venv --python 3.12 /tmp/omnigent-smoke
-          uv pip install --python /tmp/omnigent-smoke/bin/python dist/*.whl
+          python -m venv /tmp/omnigent-smoke
+          /tmp/omnigent-smoke/bin/pip install --upgrade pip
+          /tmp/omnigent-smoke/bin/pip install \
+            dist-omnigent/*.whl \
+            dist-omnigent-client/*.whl \
+            dist-omnigent-ui-sdk/*.whl
           /tmp/omnigent-smoke/bin/omnigent --version
 
-      - name: Upload built distributions
+      - name: Upload omnigent distribution
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-omnigent
-          path: dist/
+          path: dist-omnigent/
+          if-no-files-found: error
+      - name: Upload omnigent-client distribution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-omnigent-client
+          path: dist-omnigent-client/
+          if-no-files-found: error
+      - name: Upload omnigent-ui-sdk distribution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-omnigent-ui-sdk
+          path: dist-omnigent-ui-sdk/
+          if-no-files-found: error
 
   # On a failed nightly, open/update one tracking issue; close it when green.
   notify:
