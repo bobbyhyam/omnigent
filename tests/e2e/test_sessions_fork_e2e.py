@@ -263,6 +263,11 @@ def test_full_fork_replays_whole_history(
     )
 
 
+# Truncating a fork at a mid-conversation cutoff (dropping the post-cutoff turn)
+# is server-side behavior that shipped after v0.2.0 — a v0.2.0 server keeps the
+# post-cutoff turn, so main's test (unchanged) fails against it (server-behavior
+# co-evolution, not a regression). Skip against servers < 0.3.0.
+@pytest.mark.min_server_version("0.3.0")
 def test_fork_from_middle_truncates_context(
     http_client: httpx.Client,
     live_runner_id: str,
