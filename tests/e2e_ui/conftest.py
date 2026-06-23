@@ -92,16 +92,19 @@ _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 # validator at registration time (no shim defaults applied), so the
 # YAML must carry an explicit ``executor`` block — otherwise the
 # server rejects with ``executor.config.harness: required when
-# executor.type is 'omnigent'``. The mock LLM server handles
-# The model name (databricks-gpt-5-4) is used for harness routing only;
-# harness auto-picks ``openai-agents`` and routes requests to the
-# in-process mock rather than a real provider.
+# executor.type is 'omnigent'``. The model name (gpt-4o-mini) is a plain
+# (non-``databricks-``) name on purpose: the openai-agents harness then
+# resolves no provider auth and falls back to ``OPENAI_BASE_URL`` (the
+# in-process mock) rather than routing to the Databricks gateway, which
+# would need real credentials CI does not have. A ``databricks-``-prefixed
+# model forces Databricks DEFAULT-profile auth (see
+# omnigent/runtime/workflow.py) and fails with DatabricksAuthError in CI.
 _TEST_AGENT_YAML = """\
 name: hello_world
 prompt: You are a friendly assistant. Say hello and answer questions.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -168,7 +171,7 @@ name: {_FILES_PROBE_NO_ENV_AGENT_NAME}
 prompt: You are a terse assistant with no filesystem.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 """
@@ -177,7 +180,7 @@ name: {_FILES_PROBE_ENV_AGENT_NAME}
 prompt: You are a terse assistant with a filesystem.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -905,7 +908,7 @@ def live_server(
     # Fallback for the openai-agents harness: any agent turn that doesn't
     # match a content-based queue gets a generic reply (sufficient for tests
     # that only assert an assistant bubble appears, not its exact content).
-    set_fallback_mock_llm(mock_url, "databricks-gpt-5-4", "Mock LLM response.")
+    set_fallback_mock_llm(mock_url, "gpt-4o-mini", "Mock LLM response.")
 
     try:
         yield base_url
@@ -1205,7 +1208,7 @@ prompt: |
   other tools.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -1251,6 +1254,7 @@ def terminal_agent(live_server: str) -> Iterator[str]:
 @pytest.fixture
 def terminal_session(
     terminal_agent: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
     """Create a runner-bound session using the terminal-capable agent.
@@ -1263,6 +1267,9 @@ def terminal_session(
 
     :param terminal_agent: Live server base URL with the terminal agent
         registered.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL; used to
+        queue the deterministic launch/send/confirm tool sequence the agent
+        runs in response to "spin up zsh".
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``.
     """
@@ -1272,6 +1279,46 @@ def terminal_session(
     import tarfile
 
     live_server = terminal_agent
+
+    # The "spin up zsh" prompt drives three ordered LLM turns: launch the
+    # terminal, type the file-writing command, then confirm. Content-route on
+    # the prompt text so the queue fires only for this fixture's turns, and
+    # order the three responses to match the agent's prompted sequence.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_launch",
+                        "name": "sys_terminal_launch",
+                        "arguments": _json.dumps({"terminal": "zsh", "session": "main"}),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_send",
+                        "name": "sys_terminal_send",
+                        "arguments": _json.dumps(
+                            {
+                                "terminal": "zsh",
+                                "session": "main",
+                                "text": (
+                                    f"printf '%s\\n' '{_TERMINAL_PANEL_FILE_CONTENT}' "
+                                    f"> {_TERMINAL_PANEL_FILE}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "The zsh terminal is running and the file was written."},
+        ],
+        key="terminal-spin-up-zsh",
+        match="spin up zsh",
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     # Create a session with the terminal agent bundle inline.
@@ -1387,7 +1434,7 @@ prompt: |
   sub-agent session via `sys_session_send` — NEVER spawn a second one.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   harness: openai-agents
 
 tools:
@@ -1397,7 +1444,7 @@ tools:
       Deep Thought, the supercomputer built to compute the Answer to the
       Ultimate Question of Life, the Universe, and Everything.
     executor:
-      model: databricks-gpt-5-4
+      model: gpt-4o-mini
       harness: openai-agents
     prompt: |
       You are Deep Thought from The Hitchhiker's Guide to the Galaxy.
@@ -1523,7 +1570,7 @@ prompt: |
   other command or call any other tool.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -1579,7 +1626,7 @@ def approval_session(
     # entirely — no other request will ever use this model key.
     approval_model = f"approval-probe-{_uuid.uuid4().hex[:8]}"
     # Substitute the unique model into the agent spec.
-    agent_yaml_text = _APPROVAL_AGENT_YAML.replace("databricks-gpt-5-4", approval_model)
+    agent_yaml_text = _APPROVAL_AGENT_YAML.replace("gpt-4o-mini", approval_model)
 
     # First LLM call: return the gated sys_os_shell tool call.
     configure_mock_llm(
@@ -1729,7 +1776,7 @@ prompt: |
   and nothing else — no preamble, no quotes, no trailing punctuation.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 """

@@ -51,7 +51,7 @@ _TURNS = 5
 _CUSTOM_TURN_TIMEOUT_MS = 90_000
 
 # Model name baked into _CUSTOM_AGENT_YAML; used to key the mock fallback.
-_ECHO_PROBE_MODEL = "databricks-gpt-5-4"
+_ECHO_PROBE_MODEL = "gpt-4o-mini"
 
 
 def _send(page: Page, text: str) -> None:
