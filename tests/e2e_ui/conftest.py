@@ -901,6 +901,7 @@ def live_server(
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
+    _server_state["mock_llm_url"] = mock_url
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
@@ -1069,6 +1070,7 @@ def _ensure_runner_online(
         return None
 
     binding_token = str(_server_state["binding_token"])
+    mock_url = str(_server_state.get("mock_llm_url", ""))
     runner_tmp = tmp_path_factory.mktemp("e2e_ui_respawn_runner")
     log_path = runner_tmp / "runner.log"
     log_handle = open(log_path, "w")  # noqa: SIM115 — fd dup'd into child; closed below
@@ -1079,6 +1081,11 @@ def _ensure_runner_online(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Mirror the live_server runner's mock-LLM routing so the
+        # respawned runner's harness also hits the mock.
+        **(
+            {"OPENAI_BASE_URL": f"{mock_url}/v1", "OPENAI_API_KEY": "mock-key"} if mock_url else {}
+        ),
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
