@@ -854,6 +854,7 @@ async def _auto_create_opencode_terminal(
         OpenCodeNativeBridgeState,
         clear_bridge_state,
         prepare_bridge_dir,
+        seed_opencode_auth,
         write_bridge_state,
     )
     from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
@@ -910,6 +911,12 @@ async def _auto_create_opencode_terminal(
             xdg_config_home_for_bridge_dir(bridge_dir),
             build_opencode_model_default_config(model_override),
         )
+
+    # The server runs with a per-session XDG_DATA_HOME, so copy the user's
+    # `opencode auth login` credentials in — otherwise it can't authenticate
+    # their providers and falls back to the no-auth default model. No-op on a
+    # remote runner (no local auth.json) / Databricks-gateway path.
+    seed_opencode_auth(bridge_dir)
 
     server = OpenCodeNativeServer(bridge_dir=bridge_dir, workspace=launch_config.workspace)
     await server.start()

@@ -146,3 +146,29 @@ def test_spawn_env_bridge_id_override(monkeypatch: pytest.MonkeyPatch, tmp_path:
     env = build_opencode_native_spawn_env("conv_abc", bridge_id="bridge_xyz")
     assert env["HARNESS_OPENCODE_NATIVE_BRIDGE_DIR"] == str(bridge_dir_for_bridge_id("bridge_xyz"))
     assert env["HARNESS_OPENCODE_NATIVE_REQUEST_SESSION_ID"] == "conv_abc"
+
+
+def test_seed_opencode_auth_copies_user_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The user's auth.json is copied into the per-session XDG_DATA_HOME (0600)."""
+    user_data = tmp_path / "user-share"
+    (user_data / "opencode").mkdir(parents=True)
+    (user_data / "opencode" / "auth.json").write_text('{"anthropic": {"type": "api"}}')
+    monkeypatch.setenv("XDG_DATA_HOME", str(user_data))
+
+    bridge_dir = bridge.prepare_bridge_dir("conv_seed")
+    dest = bridge.seed_opencode_auth(bridge_dir)
+    assert dest is not None and dest.is_file()
+    assert dest == bridge.xdg_data_home_for_bridge_dir(bridge_dir) / "opencode" / "auth.json"
+    assert "anthropic" in dest.read_text()
+    assert (os.stat(dest).st_mode & 0o777) == 0o600
+
+
+def test_seed_opencode_auth_noop_without_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No user auth.json → no-op (returns None), e.g. on a remote runner."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-share"))
+    bridge_dir = bridge.prepare_bridge_dir("conv_noseed")
+    assert bridge.seed_opencode_auth(bridge_dir) is None

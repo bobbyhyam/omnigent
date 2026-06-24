@@ -9728,10 +9728,20 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     :param current: The currently-persisted default model, or ``None``.
     """
     from omnigent.onboarding.interactive import console, select
+    from omnigent.onboarding.opencode_auth import reachable_provider_ids
 
     models = _list_opencode_models()
     if not models:
         return "✗ no models — sign in to a provider first (opencode auth login)"
+    # `opencode models` can list hundreds of `provider/model` ids across every
+    # provider on models.dev — too long for the picker (it overflows the
+    # viewport and flickers). Narrow to the providers the user can actually
+    # authenticate (stored auth.json + env keys); fall back to the full list
+    # only if that filter would hide everything.
+    reachable = reachable_provider_ids()
+    if reachable:
+        scoped = [m for m in models if m.split("/", 1)[0] in reachable]
+        models = scoped or models
     options = list(models)
     clear_index = -1
     if current is not None:

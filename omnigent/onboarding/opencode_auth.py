@@ -23,19 +23,21 @@ from pathlib import Path
 
 from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_cli_installed
 
-# Common OpenCode provider env vars → display label. Not exhaustive (OpenCode
+# Common OpenCode providers → (provider id, display label, env var). The
+# provider id matches OpenCode's own id (the ``auth.json`` key and the
+# ``provider/model`` prefix in ``opencode models``). Not exhaustive (OpenCode
 # resolves many providers from models.dev); this is the set worth surfacing in
 # setup, including the ``OPENAI_*`` pair the Databricks-gateway path uses.
-_ENV_PROVIDER_VARS: tuple[tuple[str, str], ...] = (
-    ("OpenAI", "OPENAI_API_KEY"),
-    ("Anthropic", "ANTHROPIC_API_KEY"),
-    ("Google Gemini", "GEMINI_API_KEY"),
-    ("Google Gemini", "GOOGLE_GENERATIVE_AI_API_KEY"),
-    ("Groq", "GROQ_API_KEY"),
-    ("OpenRouter", "OPENROUTER_API_KEY"),
-    ("xAI", "XAI_API_KEY"),
-    ("Mistral", "MISTRAL_API_KEY"),
-    ("DeepSeek", "DEEPSEEK_API_KEY"),
+_ENV_PROVIDER_VARS: tuple[tuple[str, str, str], ...] = (
+    ("openai", "OpenAI", "OPENAI_API_KEY"),
+    ("anthropic", "Anthropic", "ANTHROPIC_API_KEY"),
+    ("google", "Google Gemini", "GEMINI_API_KEY"),
+    ("google", "Google Gemini", "GOOGLE_GENERATIVE_AI_API_KEY"),
+    ("groq", "Groq", "GROQ_API_KEY"),
+    ("openrouter", "OpenRouter", "OPENROUTER_API_KEY"),
+    ("xai", "xAI", "XAI_API_KEY"),
+    ("mistral", "Mistral", "MISTRAL_API_KEY"),
+    ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
 )
 
 
@@ -68,10 +70,24 @@ def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:
     """Return provider labels whose API-key env var is present."""
     env = os.environ if environ is None else environ
     seen: list[str] = []
-    for label, var in _ENV_PROVIDER_VARS:
+    for _provider_id, label, var in _ENV_PROVIDER_VARS:
         if env.get(var, "").strip() and label not in seen:
             seen.append(label)
     return tuple(seen)
+
+
+def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[str]:
+    """Return OpenCode provider ids reachable from stored auth + env keys.
+
+    Ids match OpenCode's own (the ``provider/model`` prefix), so callers can
+    filter a model list down to what the user can actually authenticate.
+    """
+    env = os.environ if environ is None else environ
+    ids = set(_stored_providers())
+    for provider_id, _label, var in _ENV_PROVIDER_VARS:
+        if env.get(var, "").strip():
+            ids.add(provider_id)
+    return frozenset(ids)
 
 
 @dataclass(frozen=True)

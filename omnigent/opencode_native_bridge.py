@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,6 +191,50 @@ def xdg_config_home_for_bridge_dir(bridge_dir: Path) -> Path:
     :returns: Absolute ``XDG_CONFIG_HOME`` directory.
     """
     return bridge_dir / _XDG_CONFIG_DIR
+
+
+def user_opencode_auth_path() -> Path:
+    """
+    Return the user's real OpenCode ``auth.json`` path (not the per-session one).
+
+    Honors ``XDG_DATA_HOME`` (the runner's own env, which is the user's real
+    data home — the per-session override is set only on the spawned server),
+    defaulting to ``~/.local/share/opencode/auth.json``.
+    """
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "opencode" / "auth.json"
+
+
+def seed_opencode_auth(bridge_dir: Path) -> Path | None:
+    """
+    Copy the user's OpenCode ``auth.json`` into the per-session ``XDG_DATA_HOME``.
+
+    The runner spawns ``opencode serve`` with a per-session ``XDG_DATA_HOME``
+    that isolates session state — but it also hides the user's
+    ``opencode auth login`` credentials (in their real
+    ``~/.local/share/opencode/auth.json``). Without those, the server can only
+    reach OpenCode's no-auth default model (``opencode/big-pickle``), so a
+    user-selected provider/model never takes effect. Copy the credentials in
+    (best-effort, ``0600``) so the user's providers — and any pinned model that
+    needs them — work. Refreshed on every spawn so re-logins propagate.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: The destination path written, or ``None`` when there is no
+        source ``auth.json`` or the copy fails.
+    """
+    src = user_opencode_auth_path()
+    if not src.is_file():
+        return None
+    dest_dir = xdg_data_home_for_bridge_dir(bridge_dir) / "opencode"
+    try:
+        dest_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        dest = dest_dir / "auth.json"
+        shutil.copyfile(src, dest)
+        os.chmod(dest, 0o600)
+    except OSError:
+        return None
+    return dest
 
 
 def auth_secret_path(bridge_dir: Path) -> Path:

@@ -14,7 +14,7 @@ import omnigent.onboarding.opencode_auth as oc
 def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Point XDG_DATA_HOME at a tmp dir and clear provider env keys."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
-    for _label, var in oc._ENV_PROVIDER_VARS:
+    for _provider_id, _label, var in oc._ENV_PROVIDER_VARS:
         monkeypatch.delenv(var, raising=False)
 
 
@@ -76,3 +76,14 @@ def test_describe_lists_stored_and_env(monkeypatch: pytest.MonkeyPatch, tmp_path
     text = oc.opencode_auth_summary().describe()
     assert "1 stored (anthropic)" in text
     assert "env: OpenAI" in text
+
+
+def test_reachable_provider_ids_merges_stored_and_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_auth(tmp_path, {"anthropic": {"type": "api", "key": "x"}})
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    ids = oc.reachable_provider_ids()
+    assert "anthropic" in ids  # from auth.json
+    assert "openai" in ids  # from env key
+    assert "groq" not in ids
