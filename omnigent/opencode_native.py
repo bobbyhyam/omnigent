@@ -387,8 +387,7 @@ async def _fetch_opencode_session(client: httpx.AsyncClient, session_id: str) ->
         raise click.ClickException(f"Conversation {session_id!r} not found on the server.")
     if resp.status_code >= 400:
         raise click.ClickException(
-            f"Failed to fetch conversation {session_id!r} "
-            f"({resp.status_code}): {error_text(resp)}"
+            f"Failed to fetch conversation {session_id!r} ({resp.status_code}): {error_text(resp)}"
         )
     payload = resp.json()
     if not isinstance(payload, dict):

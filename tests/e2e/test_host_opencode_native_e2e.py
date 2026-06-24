@@ -155,9 +155,13 @@ def test_opencode_native_multiturn_item_order(
             # Wait until at least i+1 assistant message items exist.
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
-                data = http_client.get(
-                    f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
-                ).json().get("data", [])
+                data = (
+                    http_client.get(
+                        f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
+                    )
+                    .json()
+                    .get("data", [])
+                )
                 n_asst = sum(
                     1
                     for it in data
@@ -167,9 +171,13 @@ def test_opencode_native_multiturn_item_order(
                     break
                 time.sleep(POLL_INTERVAL_S)
 
-        data = http_client.get(
-            f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
-        ).json().get("data", [])
+        data = (
+            http_client.get(
+                f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
+            )
+            .json()
+            .get("data", [])
+        )
         print("\n===ITEMS_DUMP_START===")
         for it in data:
             text = ""
@@ -262,9 +270,7 @@ def test_opencode_native_host_session_auto_creates_terminal(
         # The `omnigent opencode` CLI launcher attaches this TTY directly to the
         # runner-owned tmux pane, so the terminal resource must expose the tmux
         # socket + target — assert that prerequisite is present.
-        detail = http_client.get(
-            f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
-        )
+        detail = http_client.get(f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
         detail.raise_for_status()
         meta = detail.json().get("metadata", {})
         assert meta.get("tmux_socket"), f"terminal has no tmux_socket: {meta}"

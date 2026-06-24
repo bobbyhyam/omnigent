@@ -69,9 +69,7 @@ def test_summary_not_ready_when_cli_absent(
     assert oc.opencode_auth_summary().ready is False  # provider present but no binary
 
 
-def test_describe_lists_stored_and_env(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_describe_lists_stored_and_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
     _write_auth(tmp_path, {"anthropic": {"type": "api", "key": "x"}})
     monkeypatch.setenv("OPENAI_API_KEY", "sk-x")

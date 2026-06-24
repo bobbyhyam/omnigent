@@ -4,13 +4,7 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
-export type NativeCodingAgentIconKind =
-  | "claude"
-  | "codex"
-  | "opencode"
-  | "pi"
-  | "cursor"
-  | "goose";
+export type NativeCodingAgentIconKind = "claude" | "codex" | "opencode" | "pi" | "cursor" | "goose";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {

@@ -86,9 +86,7 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
     }
 
 
-def write_opencode_provider_config(
-    xdg_config_home: Path, config: Mapping[str, object]
-) -> Path:
+def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
     """
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
 
