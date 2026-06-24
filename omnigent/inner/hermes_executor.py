@@ -170,14 +170,25 @@ def _get_conversation_id() -> str | None:
     return None
 
 
-def _load_user_hermes_config() -> dict:
-    """Load the user's ``~/.hermes/config.yaml`` if it exists.
+# Keys from the user's ``~/.hermes/config.yaml`` that the per-session
+# HERMES_HOME needs in order to authenticate with the inference provider.
+# Everything else (secrets, security, agent tuning, terminal, etc.) is
+# either irrelevant to a headless Omnigent turn or actively harmful
+# (e.g. ``secrets.bitwarden`` referencing an unset ``BWS_ACCESS_TOKEN``).
+_USER_CONFIG_KEYS = frozenset({
+    "model",
+    "providers",
+    "fallback_providers",
+    "credential_pool_strategies",
+})
 
-    Returns the parsed YAML dict, or ``{}`` when the file is missing
-    or malformed.  Only the provider/model keys are interesting — the
-    per-session ``config.yaml`` merges them with Omnigent's policy-hook
-    config so Hermes can authenticate with the user's configured
-    inference provider.
+
+def _load_user_hermes_config() -> dict:
+    """Load inference-relevant keys from the user's ``~/.hermes/config.yaml``.
+
+    Returns a dict containing only the keys Hermes needs to resolve a
+    model and authenticate (see :data:`_USER_CONFIG_KEYS`), or ``{}``
+    when the file is missing or malformed.
     """
     user_config = Path.home() / ".hermes" / "config.yaml"
     if not user_config.is_file():
@@ -185,7 +196,8 @@ def _load_user_hermes_config() -> dict:
     try:
         import yaml  # noqa: PLC0415 — yaml is a Hermes dep, always available
 
-        return yaml.safe_load(user_config.read_text()) or {}
+        full = yaml.safe_load(user_config.read_text()) or {}
+        return {k: v for k, v in full.items() if k in _USER_CONFIG_KEYS}
     except Exception:
         _logger.debug("Failed to load user Hermes config at %s", user_config, exc_info=True)
         return {}
