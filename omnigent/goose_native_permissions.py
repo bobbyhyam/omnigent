@@ -74,9 +74,14 @@ class GooseApprovalPrompt:
     block_hash: str
 
 
-def goose_permission_elicitation_id(session_id: str, block_hash: str) -> str:
-    """Return the deterministic Omnigent elicitation id for a Goose prompt."""
-    return f"elicit_goose_{session_id}_{block_hash}"
+def goose_permission_elicitation_id(session_id: str, token: str) -> str:
+    """Return the deterministic Omnigent elicitation id for a Goose prompt.
+
+    *token* identifies one approval episode (a per-session counter), not the
+    scraped content — the rendered tool context above the cliclack widget jitters
+    across polls, so hashing it spawned a duplicate card every poll.
+    """
+    return f"elicit_goose_{session_id}_{token}"
 
 
 def _looks_like_item(line: str) -> bool:
@@ -156,6 +161,7 @@ async def supervise_goose_approval_mirror(
     :param poll_interval_s: Pane poll cadence in seconds.
     """
     active: dict[str, object] | None = None
+    episode = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -165,10 +171,14 @@ async def supervise_goose_approval_mirror(
                 pane = await asyncio.to_thread(capture_goose_pane, bridge_dir)
                 prompt = parse_goose_approval_prompt(pane) if pane else None
                 if prompt is not None:
-                    if active is None or active["key"] != prompt.block_hash:
-                        elicitation_id = goose_permission_elicitation_id(
-                            session_id, prompt.block_hash
-                        )
+                    # Rising edge only: ONE card per visible-prompt episode. We do
+                    # NOT re-mint while the prompt stays up — the scraped tool
+                    # context above the cliclack widget jitters across polls, and
+                    # keying on it previously parked a fresh card every poll (all
+                    # left dangling when the TUI answer cleared only the latest).
+                    if active is None:
+                        episode += 1
+                        elicitation_id = goose_permission_elicitation_id(session_id, str(episode))
                         task = asyncio.create_task(
                             _run_one_approval(
                                 client,
@@ -177,14 +187,13 @@ async def supervise_goose_approval_mirror(
                                 prompt=prompt,
                                 elicitation_id=elicitation_id,
                             ),
-                            name=f"goose-approval-{prompt.block_hash}",
+                            name=f"goose-approval-{episode}",
                         )
-                        active = {
-                            "key": prompt.block_hash,
-                            "elicitation_id": elicitation_id,
-                            "task": task,
-                        }
+                        active = {"elicitation_id": elicitation_id, "task": task}
                 elif active is not None:
+                    # Falling edge: the prompt vanished. If the web card is still
+                    # parked (answered in the TUI), release it; if the task already
+                    # finished (answered via the web verdict), nothing to do.
                     task = active["task"]
                     if isinstance(task, asyncio.Task) and not task.done():
                         await _post_external_elicitation_resolved(

@@ -6,21 +6,26 @@ lives only in the TUI; to also surface it in the Omnigent web UI (so a user can
 approve from the chat view, not only the embedded terminal), the runner watches
 the Hermes pane:
 
-1. poll ``capture-pane`` and detect the approval block — Hermes renders
-   ``⚠️  DANGEROUS COMMAND: <cmd>`` followed by a ``Choice [o/s/a/D]:`` prompt
-   (the menu is ``[o]nce | [s]ession | [a]lways | [d]eny``); verified against
-   Hermes' own i18n catalog (``locales/en.yaml``),
+1. poll ``capture-pane`` and detect the approval PANEL — the interactive TUI
+   renders a prompt_toolkit panel titled ``⚠️  Dangerous Command`` with NUMBERED
+   choices (``❯ 1. Allow once`` … ``4. Deny``), NOT the legacy ``Choice
+   [o/s/a/D]:`` ``input()`` prompt (that path is fail-closed while prompt_toolkit
+   owns the terminal). Verified against hermes-agent ``cli.py``
+   ``_get_approval_display_fragments`` + the number-key bindings,
 2. POST it to the server's generic ``native-permission-request`` hook, which
    publishes ``response.elicitation_request`` and parks for the web verdict,
-3. on the verdict, send the advertised key (``o`` = allow once, ``d`` = deny)
-   into the pane,
-4. if the prompt instead disappears on its own (answered in the embedded
+3. on the verdict, send the choice's DIGIT key (e.g. ``1`` = Allow once, ``4`` =
+   Deny) into the pane — Hermes' number-key binding selects AND confirms in one
+   press,
+4. if the panel instead disappears on its own (answered in the embedded
    terminal), POST ``external_elicitation_resolved`` so the parked web card
    clears.
 
-This does NOT suppress Hermes' own gate — its prompt stays the source of truth
-and the fallback if pane detection ever fails (the user can still answer ``o``/
-``d`` in the terminal). Mirrors :mod:`omnigent.cursor_native_permissions`.
+This does NOT suppress Hermes' own gate — its panel stays the source of truth
+and the fallback if pane detection ever fails (the user can still pick in the
+terminal). Mirrors :mod:`omnigent.cursor_native_permissions`. NB: Hermes only
+prompts for commands it flags *dangerous* (and may auto-approve low-risk ones via
+smart-approval), so non-dangerous tools won't raise a card.
 """
 
 from __future__ import annotations
@@ -43,29 +48,33 @@ _POLL_INTERVAL_S = 0.3
 # POST never abandons a live prompt.
 _POST_TIMEOUT_S = 86400.0
 
-# Hermes' dangerous-command prompt markers (see hermes-agent locales/en.yaml):
-#   ⚠️  DANGEROUS COMMAND: <description>
-#         [o]nce  |  [s]ession  |  [a]lways  |  [d]eny
-#         Choice [o/s/a/D]:
-_HEADER_RE = re.compile(r"DANGEROUS COMMAND:\s*(?P<cmd>.*\S)?", re.IGNORECASE)
-# The ``Choice [o/s...]:`` line is only present while the prompt is awaiting an
-# answer, so it's the liveness signal (the header may linger in scrollback).
-_CHOICE_RE = re.compile(r"Choice\s*\[o/s", re.IGNORECASE)
-_ACCEPT_KEY = "o"  # [o]nce
-_DECLINE_KEY = "d"  # [d]eny
+# Hermes' interactive TUI renders the dangerous-command gate as a prompt_toolkit
+# PANEL (cli.py ``_get_approval_display_fragments``), NOT the legacy ``input()``
+# ``Choice [o/s/a/D]:`` prompt — that path is fail-closed while prompt_toolkit
+# owns the terminal. The panel is titled ``⚠️  Dangerous Command`` and lists
+# NUMBERED choices (``❯ 1. Allow once`` … ``4. Deny``); pressing the number both
+# selects and confirms (cli.py number-key bindings call _handle_approval_selection).
+# So we detect the panel by title + numbered choices and answer with the digit.
+_TITLE_RE = re.compile(r"Dangerous Command", re.IGNORECASE)
+# A numbered choice row, e.g. "❯ 1. Allow once" / "  4. Deny" (box borders ignored).
+_CHOICE_RE = re.compile(
+    r"(?P<num>\d)\.\s*(?P<label>Allow once|Allow for this session|"
+    r"Add to permanent allowlist|Deny)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
 class HermesApprovalPrompt:
-    """A parsed Hermes dangerous-command approval prompt.
+    """A parsed Hermes dangerous-command approval panel.
 
-    :param command: The flagged command/description, e.g. ``"rm -rf /tmp/x"``.
+    :param command: Best-effort command/description preview from the panel.
     :param message: Human-readable card message.
-    :param preview: Compact preview for the card (the command).
-    :param accept_key: tmux key to approve once (``"o"``).
-    :param decline_key: tmux key to deny (``"d"``).
-    :param block_hash: Stable hash of the command used to dedupe across polls and
-        to mint a stable elicitation id.
+    :param preview: Compact preview for the card.
+    :param accept_key: digit key that selects+confirms "Allow once" (e.g. ``"1"``).
+    :param decline_key: digit key that selects+confirms "Deny" (e.g. ``"4"`` with
+        the permanent-allowlist option, else ``"3"``).
+    :param block_hash: Stable hash of the preview (kept for debugging/preview).
     """
 
     command: str
@@ -76,42 +85,63 @@ class HermesApprovalPrompt:
     block_hash: str
 
 
-def hermes_permission_elicitation_id(session_id: str, block_hash: str) -> str:
-    """Return the deterministic Omnigent elicitation id for a Hermes prompt."""
-    return f"elicit_hermes_{session_id}_{block_hash}"
+def hermes_permission_elicitation_id(session_id: str, token: str) -> str:
+    """Return the deterministic Omnigent elicitation id for a Hermes prompt.
+
+    *token* identifies one approval episode (a per-session counter), not the
+    scraped content, so a re-render never spawns a duplicate card.
+    """
+    return f"elicit_hermes_{session_id}_{token}"
+
+
+def _strip_border(line: str) -> str:
+    """Strip the panel's box-drawing borders/padding from *line*."""
+    return line.strip().strip("│").strip()
 
 
 def parse_hermes_approval_prompt(pane: str) -> HermesApprovalPrompt | None:
-    """Parse a Hermes dangerous-command approval block from rendered pane text.
+    """Parse a Hermes ``⚠️  Dangerous Command`` approval panel from pane text.
 
-    Requires BOTH the ``DANGEROUS COMMAND:`` header and a live ``Choice [o/s…]:``
-    prompt line, so a header lingering in scrollback (already answered) is not
-    re-detected.
+    Requires the panel title AND both an "Allow once" and a "Deny" numbered
+    choice (so a title lingering without the live choice list is not re-detected),
+    and reads the digit key for each from the panel itself — robust to whether the
+    permanent-allowlist option is offered (Deny is ``4`` with it, ``3`` without).
 
     :param pane: Visible pane text from ``capture-pane -p``.
-    :returns: The parsed prompt, or ``None`` when no live prompt is visible.
+    :returns: The parsed prompt, or ``None`` when no live panel is visible.
     """
-    if not pane or not _CHOICE_RE.search(pane):
+    if not pane or not _TITLE_RE.search(pane):
         return None
-    command = ""
-    for line in pane.splitlines():
-        match = _HEADER_RE.search(line)
+    lines = pane.splitlines()
+    label_to_key: dict[str, str] = {}
+    first_choice_idx: int | None = None
+    for i, line in enumerate(lines):
+        match = _CHOICE_RE.search(line)
         if match:
-            command = (match.group("cmd") or "").strip()
-            # Drop a leading/trailing decorative spaces and any status glyphs.
-            command = command.strip()
-    # The header must be present (not just the Choice line) to avoid matching a
-    # different prompt that happens to advertise o/s keys.
-    if not _HEADER_RE.search(pane):
+            label_to_key.setdefault(match.group("label").lower(), match.group("num"))
+            if first_choice_idx is None:
+                first_choice_idx = i
+    accept_key = label_to_key.get("allow once")
+    decline_key = label_to_key.get("deny")
+    if accept_key is None or decline_key is None or first_choice_idx is None:
         return None
-    preview = command[:1024]
-    block_hash = hashlib.sha256(command.encode("utf-8")).hexdigest()[:16]
+
+    # Best-effort command/description preview: the panel lines between the title
+    # and the first choice, minus borders/blank/title lines.
+    title_idx = next((i for i, line in enumerate(lines) if _TITLE_RE.search(line)), 0)
+    preview_parts: list[str] = []
+    for line in lines[title_idx + 1 : first_choice_idx]:
+        text = _strip_border(line)
+        if text and not _TITLE_RE.search(text):
+            preview_parts.append(text)
+    preview = " ".join(preview_parts)[:1024]
+    block_hash = hashlib.sha256(preview.encode("utf-8")).hexdigest()[:16]
     return HermesApprovalPrompt(
-        command=command,
+        command=preview,
         message="Hermes flagged a dangerous command. Run it?",
-        preview=preview,
-        accept_key=_ACCEPT_KEY,
-        decline_key=_DECLINE_KEY,
+        preview=preview or "dangerous command",
+        accept_key=accept_key,
+        decline_key=decline_key,
         block_hash=block_hash,
     )
 
@@ -140,6 +170,7 @@ async def supervise_hermes_approval_mirror(
     :param poll_interval_s: Pane poll cadence in seconds.
     """
     active: dict[str, object] | None = None
+    episode = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -149,10 +180,11 @@ async def supervise_hermes_approval_mirror(
                 pane = await asyncio.to_thread(capture_hermes_pane, bridge_dir)
                 prompt = parse_hermes_approval_prompt(pane) if pane else None
                 if prompt is not None:
-                    if active is None or active["key"] != prompt.block_hash:
-                        elicitation_id = hermes_permission_elicitation_id(
-                            session_id, prompt.block_hash
-                        )
+                    # Rising edge only: ONE card per visible-prompt episode (do not
+                    # re-mint while the prompt stays up).
+                    if active is None:
+                        episode += 1
+                        elicitation_id = hermes_permission_elicitation_id(session_id, str(episode))
                         task = asyncio.create_task(
                             _run_one_approval(
                                 client,
@@ -161,14 +193,12 @@ async def supervise_hermes_approval_mirror(
                                 prompt=prompt,
                                 elicitation_id=elicitation_id,
                             ),
-                            name=f"hermes-approval-{prompt.block_hash}",
+                            name=f"hermes-approval-{episode}",
                         )
-                        active = {
-                            "key": prompt.block_hash,
-                            "elicitation_id": elicitation_id,
-                            "task": task,
-                        }
+                        active = {"elicitation_id": elicitation_id, "task": task}
                 elif active is not None:
+                    # Falling edge: prompt vanished. Release the card if still
+                    # parked (answered in the TUI); no-op if answered via the web.
                     task = active["task"]
                     if isinstance(task, asyncio.Task) and not task.done():
                         await _post_external_elicitation_resolved(
