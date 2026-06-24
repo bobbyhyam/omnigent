@@ -85,6 +85,13 @@ def _user_policy_by_name(base_url: str, session_id: str, name: str) -> dict | No
     return None
 
 
+def _agent_mcp_names(base_url: str, session_id: str) -> set[str]:
+    """Names of MCP servers on the session's bound agent."""
+    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/agent", timeout=10.0)
+    resp.raise_for_status()
+    return {server["name"] for server in resp.json()["mcp_servers"]}
+
+
 def _open_popover(page: Page) -> None:
     """Open the agent-info popover from a known-closed state, idempotently.
 
@@ -187,6 +194,32 @@ def test_agent_info_policy_integer_params_validate_and_submit(
     stored_policy = _user_policy_by_name(base_url, session_id, stored_name)
     assert stored_policy is not None
     assert stored_policy["factory_params"] == {"limit": 100}
+
+
+def test_agent_info_mcp_server_add_and_remove(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Popover → manage MCP servers → add → REST reflects it → delete."""
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+    assert not _agent_mcp_names(base_url, session_id), "session started with MCP servers"
+
+    _open_popover(page)
+    page.get_by_role("button", name="Manage MCP servers").click()
+    dialog = page.get_by_role("dialog").filter(has=page.get_by_text("Manage MCP Servers"))
+    expect(dialog).to_be_visible(timeout=15_000)
+    dialog.get_by_label("Name").fill("ui-search")
+    dialog.get_by_label("URL").fill("https://example.com/sse")
+    dialog.get_by_role("button", name="Save").click()
+
+    _wait_for(lambda: _agent_mcp_names(base_url, session_id) == {"ui-search"})
+    expect(dialog.get_by_role("button", name="Edit ui-search")).to_be_visible(timeout=15_000)
+
+    dialog.get_by_role("button", name="Delete ui-search").click()
+    _wait_for(lambda: not _agent_mcp_names(base_url, session_id))
 
 
 def _wait_for(predicate, *, timeout_s: float = 15.0, interval_s: float = 0.25) -> None:

@@ -18126,6 +18126,7 @@ def create_sessions_router(
             updated_at=agent.updated_at,
             harness=harness,
             mcp_servers=mcp_servers,
+            mcp_servers_editable=agent.session_id is not None,
             policies=policies,
             skills=skills,
             terminals=terminals,
