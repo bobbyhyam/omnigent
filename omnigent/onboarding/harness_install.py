@@ -185,21 +185,19 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
     "pi-native": PI_KEY,
-    "opencode-native": OPENCODE_KEY,
     "cursor-native": CURSOR_KEY,
-    # Goose: native TUI (``goose-native``) + headless ACP (``goose``, drives
-    # ``goose acp``) both wrap the ``goose`` CLI. Canonical ids only — the
-    # reversed ``native-goose`` alias folds to ``goose-native`` via
-    # canonicalize_harness before any lookup here.
+    "native-cursor": CURSOR_KEY,
     "goose-native": GOOSE_KEY,
+    "native-goose": GOOSE_KEY,
+    # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
+    # ``goose`` CLI as the native TUI, so it gates on the same binary.
     GOOSE_KEY: GOOSE_KEY,
     QWEN_KEY: QWEN_KEY,
-    # NB: only CANONICAL harness ids appear as keys (the descriptor-parity
-    # contract asserts ``_HARNESS_NAME_TO_KEY`` keys are cli-backed descriptor
-    # ids). Reversed aliases like ``native-cursor`` / ``qwen-code`` are folded
-    # to their canonical id by ``canonicalize_harness`` before any lookup here
-    # (sub-agent dispatch in tool_dispatch.py canonicalizes first), so they
-    # need no entry of their own.
+    "qwen-code": QWEN_KEY,
+    # Native OpenCode (``opencode-native``) wraps the ``opencode`` CLI; its
+    # ``native-opencode`` reversed spelling gates on the same binary.
+    "opencode-native": OPENCODE_KEY,
+    "native-opencode": OPENCODE_KEY,
 }
 
 
@@ -213,16 +211,7 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
         ``PATH`` for *harness* to start; ``None`` for SDK-based / unknown
         harnesses that need no CLI binary.
     """
-    # ``_HARNESS_NAME_TO_KEY`` is keyed by CANONICAL harness ids only (the
-    # descriptor-parity contract). Resolve any alias/reversed-alias spelling
-    # (``native-cursor`` → ``cursor-native``, ``qwen-code`` → ``qwen``,
-    # ``native-opencode`` → ``opencode-native``) to its canonical id first so
-    # those spellings still find their CLI spec.
-    from omnigent.runtime.harness_descriptors import descriptor_for
-
-    descriptor = descriptor_for(harness)
-    canonical = descriptor.id if descriptor is not None else harness
-    key = _HARNESS_NAME_TO_KEY.get(canonical)
+    key = _HARNESS_NAME_TO_KEY.get(harness)
     return _HARNESS_INSTALL.get(key) if key is not None else None
 
 

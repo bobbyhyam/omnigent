@@ -27,7 +27,9 @@ from omnigent.opencode_native_bridge import (
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     read_bridge_state,
 )
-from omnigent.runtime.harness_descriptors import HARNESS_DESCRIPTORS
+
+# Canonical harness id, surfaced in harness error messages.
+OPENCODE_NATIVE_HARNESS_ID = "opencode-native"
 
 
 class OpenCodeNativeExecutor(NativeServerHarness):
@@ -42,7 +44,11 @@ class OpenCodeNativeExecutor(NativeServerHarness):
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
         super().__init__(
-            descriptor=HARNESS_DESCRIPTORS["opencode-native"],
+            harness_id=OPENCODE_NATIVE_HARNESS_ID,
+            # OpenCode has no live-steer endpoint, so a mid-turn message is
+            # admitted as a new prompt and the native server's own queue
+            # promotes it when the active turn finishes.
+            supports_enqueue=True,
             transport=OpenCodeHttpTransport(bridge_dir=self._bridge_dir),
             resolve_session_id=self._resolve_opencode_session_id,
             build_prompt=self._build_prompt_with_model_override,
