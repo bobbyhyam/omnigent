@@ -1605,11 +1605,18 @@ async def _auto_create_goose_terminal(
     # re-creating, so old and new tasks can't both mirror (double-posting), and
     # drop the prior terminal's stale forward cursor.
     await _cancel_auto_forwarder_task(session_id)
-    from omnigent.goose_native_bridge import bridge_dir_for_session_id, write_tmux_target
+    from omnigent.goose_native_bridge import (
+        bridge_dir_for_session_id,
+        setup_goose_native_plugin_root,
+        write_tmux_target,
+    )
     from omnigent.goose_native_forwarder import clear_goose_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_goose_bridge_state(bridge_dir)
+    # Server URL is needed before launch (the policy plugin's hook posts to it via
+    # the terminal env) and reused by the forwarder below.
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -1619,6 +1626,22 @@ async def _auto_create_goose_terminal(
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     goose_command = resolve_goose_executable()
+    # Per-session GOOSE_PATH_ROOT holding an Omnigent policy plugin so native TUI
+    # tool calls gate via the web approval card. ``None`` when Goose's real dirs
+    # can't be resolved — then we launch without gating rather than break auth.
+    goose_path_root = setup_goose_native_plugin_root(bridge_dir, goose_command=goose_command)
+    goose_env: dict[str, str] = {"GOOSE_CLI_THEME": "ansi", "GOOSE_TELEMETRY_OFF": "1"}
+    if goose_path_root is not None:
+        goose_env.update(
+            {
+                "GOOSE_PATH_ROOT": str(goose_path_root),
+                # auto = no in-TUI tool prompt; the PreToolUse hook (Omnigent) is
+                # the gate, raising the web approval card on an ASK policy.
+                "GOOSE_MODE": "auto",
+                "_OMNIGENT_SERVER_URL": server_url,
+                "_OMNIGENT_SESSION_ID": session_id,
+            }
+        )
     # Launch-unique Goose session name. `goose session --name X` (without
     # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
     # so a per-launch-unique name lets the forwarder bind to EXACTLY this
@@ -1646,7 +1669,9 @@ async def _auto_create_goose_terminal(
             # suppresses Goose's first-run "share usage data?" prompt, which
             # would otherwise block the headless pane on a fresh install. Goose's
             # provider/model come from the user's own `goose configure` (KTD4).
-            env={"GOOSE_CLI_THEME": "ansi", "GOOSE_TELEMETRY_OFF": "1"},
+            # ``goose_env`` also carries the GOOSE_PATH_ROOT + policy-hook env when
+            # tool-policy gating is active (see setup_goose_native_plugin_root).
+            env=goose_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
@@ -1677,7 +1702,6 @@ async def _auto_create_goose_terminal(
     # server URL + refresh-capable auth.
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
-    server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.goose_native_forwarder import supervise_goose_forwarder
