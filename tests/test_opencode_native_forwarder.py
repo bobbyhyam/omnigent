@@ -511,3 +511,25 @@ async def test_usage_sums_across_messages_and_dedupes() -> None:
     await fwd.handle_event(_event("message.updated", info=msg("m2", 0.02, 200)))
     after = len([b for _u, b in server.posts if b["type"] == "external_session_usage"])
     assert after == before
+
+
+async def test_model_switched_mirrors_to_omnigent_and_dedupes() -> None:
+    """TUI model switch → external_model_change (deduped)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.next.model.switched", model={"providerID": "anthropic", "id": "claude-opus-4"}
+        )
+    )
+    changes = [b["data"] for _u, b in server.posts if b["type"] == "external_model_change"]
+    assert changes[-1]["model"] == "anthropic/claude-opus-4"
+    # Same model again → no duplicate post.
+    before = len(changes)
+    await fwd.handle_event(
+        _event(
+            "session.next.model.switched", model={"providerID": "anthropic", "id": "claude-opus-4"}
+        )
+    )
+    after = len([b for _u, b in server.posts if b["type"] == "external_model_change"])
+    assert after == before

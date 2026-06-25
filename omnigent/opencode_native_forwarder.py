@@ -53,6 +53,9 @@ _EXTERNAL_COMPACTION_STATUS = "external_compaction_status"
 # Cumulative token/cost + context occupancy; the server prices it into the
 # session cost badge + context ring (same contract codex-native uses).
 _EXTERNAL_SESSION_USAGE = "external_session_usage"
+# Mirrors a model switch typed in the opencode TUI (``/model`` or the picker)
+# back to Omnigent so the web model pill stays in sync (claude-native contract).
+_EXTERNAL_MODEL_CHANGE = "external_model_change"
 
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
@@ -159,6 +162,8 @@ class OpenCodeNativeForwarder:
         # cumulative usage posted as ``external_session_usage``.
         self._usage_by_message: dict[str, dict[str, Any]] = {}
         self._last_usage_signature: tuple[tuple[str, Any], ...] | None = None
+        # Last model mirrored to Omnigent (provider/id), to dedupe switches.
+        self._last_model: str | None = None
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -655,6 +660,26 @@ class OpenCodeNativeForwarder:
         del event
         await self._post_event(_EXTERNAL_COMPACTION_STATUS, {"status": "completed"})
 
+    async def _on_model_switched(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.next.model.switched`` — mirror a TUI /model switch.
+
+        When the user switches model in the opencode TUI, reflect it to Omnigent
+        (``external_model_change`` → the session's ``model_override``) so the
+        web model pill stays in sync. Deduped against the last mirrored model.
+        """
+        model = event.properties.get("model")
+        if not isinstance(model, Mapping):
+            return
+        provider = model.get("providerID")
+        model_id = model.get("id")
+        if not (isinstance(provider, str) and isinstance(model_id, str)):
+            return
+        qualified = f"{provider}/{model_id}"
+        if qualified == self._last_model:
+            return
+        self._last_model = qualified
+        await self._post_event(_EXTERNAL_MODEL_CHANGE, {"model": qualified})
+
     async def _on_permission_asked(self, event: OpenCodeEvent) -> None:
         """Handle ``permission.v2.asked`` — evaluate policy and reply."""
         request = parse_permission_request(event.properties)
@@ -755,6 +780,8 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.next.compaction.started": OpenCodeNativeForwarder._on_compaction_started,
     "session.next.compaction.ended": OpenCodeNativeForwarder._on_compaction_ended,
     "session.compacted": OpenCodeNativeForwarder._on_compaction_ended,
+    # Mirror a TUI model switch back to Omnigent (in-harness session-cmd sync).
+    "session.next.model.switched": OpenCodeNativeForwarder._on_model_switched,
     # Permission ask: 1.17.x emits ``permission.asked``; keep the ``v2`` spelling
     # too so a point-release rename still routes through the policy gate.
     "permission.asked": OpenCodeNativeForwarder._on_permission_asked,
