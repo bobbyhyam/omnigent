@@ -324,6 +324,35 @@ class OpenCodeClient:
         )
         return True
 
+    async def seed_context(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+    ) -> bool:
+        """
+        Inject a context message without triggering a reply (``noReply``).
+
+        Used to rehydrate a fresh session with prior conversation context on a
+        cross-host resume (opencode has no history-import API). ``noReply``
+        admits the message as history without running a model turn.
+
+        :param session_id: OpenCode session id.
+        :param text: The context text to seed (e.g. the prior transcript).
+        :param provider_id: Optional model provider (opencode requires only
+            ``parts``, but a model keeps the seeded message attributed).
+        :param model_id: Optional model id.
+        :returns: ``True`` once opencode has accepted the message.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}], "noReply": True}
+        if provider_id and model_id:
+            body["model"] = {"providerID": provider_id, "modelID": model_id}
+        await self._request_json("POST", f"/session/{session_id}/message", json=body)
+        return True
+
     async def fork(
         self, session_id: str, payload: Mapping[str, Any] | None = None
     ) -> OpenCodeSession:

@@ -271,3 +271,34 @@ async def test_summarize_raises_on_error() -> None:
     with pytest.raises(OpenCodeClientError):
         await client.summarize("ses_1", provider_id="opencode", model_id="big-pickle")
     await client.aclose()
+
+
+async def test_seed_context_posts_noreply_message() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"info": {"id": "msg_1"}})
+
+    client = _client(handler)
+    assert await client.seed_context("ses_1", "prior context", provider_id="p", model_id="m")
+    assert seen["path"] == "/session/ses_1/message"
+    body = seen["body"]
+    assert body["noReply"] is True
+    assert body["parts"] == [{"type": "text", "text": "prior context"}]
+    assert body["model"] == {"providerID": "p", "modelID": "m"}
+    await client.aclose()
+
+
+async def test_seed_context_omits_model_when_absent() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    client = _client(handler)
+    assert await client.seed_context("ses_1", "ctx")
+    assert "model" not in seen["body"]
+    await client.aclose()
