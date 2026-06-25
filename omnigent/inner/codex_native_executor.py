@@ -29,6 +29,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import materialize_attachment, parse_data_uri
+from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -158,11 +159,14 @@ class CodexNativeExecutor(Executor):
         :param system_prompt: System prompt from the agent spec.
             Ignored because the native thread was created by the
             wrapper.
-        :param config: Per-turn executor config. Ignored by this
-            bridge.
+        :param config: Per-turn executor config. Its ``model`` and
+            ``extra["reasoning_effort"]`` (carrying the Omnigent web
+            ``/model`` pick) are applied as ``turn/start`` overrides;
+            everything else is ignored by this bridge.
         :returns: Async iterator yielding one terminal event.
         """
-        del tools, system_prompt, config
+        del tools, system_prompt
+        overrides = _model_effort_overrides(config)
         input_items = _latest_user_input_items(messages, self._bridge_dir)
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
@@ -227,6 +231,7 @@ class CodexNativeExecutor(Executor):
                             {
                                 "threadId": state.thread_id,
                                 "input": input_items,
+                                **overrides,
                             },
                         )
                         turn_id = response.get("result", {}).get("turn", {}).get("id")
@@ -241,6 +246,44 @@ class CodexNativeExecutor(Executor):
             yield ExecutorError(message=error_msg)
         else:
             yield TurnComplete(response=None)
+
+
+def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, Any]:
+    """
+    Build Codex ``turn/start`` model / reasoning-effort overrides.
+
+    Codex's app-server has no ``setModel``; a model or reasoning-effort
+    change selected in the Omnigent web UI is applied by passing it as a
+    ``turn/start`` override, which Codex then persists to later turns.
+    The runner threads the web ``/model`` pick into ``config.model`` and
+    the effort into ``config.extra["reasoning_effort"]`` (see
+    :class:`~omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`).
+    When neither is pinned the override dict is empty and the native
+    thread keeps its launch-pinned model — so this is a no-op for
+    sessions that never touch the web picker.
+
+    :param config: Per-turn executor config, or ``None``.
+    :returns: Override dict merged into ``turn/start`` params, e.g.
+        ``{"model": "gpt-5.3-codex", "effort": "high"}``. Empty when
+        nothing is pinned.
+    """
+    if config is None:
+        return {}
+    overrides: dict[str, Any] = {}
+    model = config.model
+    if isinstance(model, str) and model:
+        overrides["model"] = model
+    raw_effort = config.extra.get("reasoning_effort")
+    try:
+        effort = validate_effort(raw_effort, "codex", CODEX_EFFORTS)
+    except ValueError:
+        # A bad effort must not sink the turn — drop it and keep Codex's
+        # current effort rather than failing the whole dispatch.
+        _logger.warning("Ignoring unsupported codex reasoning effort: %r", raw_effort)
+        effort = None
+    if effort:
+        overrides["effort"] = effort
+    return overrides
 
 
 def _bridge_dir_from_env() -> Path:
