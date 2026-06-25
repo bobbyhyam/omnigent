@@ -178,15 +178,38 @@ to `/policies/evaluate` → the cost-budget gate reads the session cost (from th
   appears on the pane; (b) hit it while in web Chat, then open the Terminal →
   the pending approval **re-pops** on attach.
 - Known limitations to confirm, not flag as bugs:
-  - Enforcement is **tool-call-phase only** in the CURRENT integration (reactive
-    over `permission.asked`), so a TUI turn is blocked at its **first gated tool
-    call**, not at message-send; a pure-text turn with no tool calls can slip one
-    turn. This is an integration gap, **not** an opencode limit — opencode's
-    plugin `chat.message` hook fires at prompt submit and would close it (see the
-    plugin-hook follow-up in `opencode-native-gaps.md`). Most agentic turns call
-    tools, so the current tool-call gate already blocks real work.
+  - The tmux-popup gate above fires at **tool-call** time. The **request-phase**
+    gate (block at message-send, before any tool) is now handled by the policy
+    plugin — see §7b. Together they cover both prompt-submit and tool-call.
   - Enforcement can lag the in-flight turn by one message (the turn's cost posts
     on completion), same as claude/codex.
+
+### 7b. Policy plugin — REQUEST + TOOL_RESULT phases  [needs web: live turns]
+
+The `omnigent-policy.js` plugin (loaded via `opencode.json` `plugin:[…]`) bridges
+opencode's lifecycle hooks to `/policies/evaluate` for the phases the reactive
+`permission.asked` path can't reach. Verify the plugin loaded: opencode's startup
+log should mention the plugin, and `opencode.json` should list it under `plugin`.
+- **REQUEST phase** (`chat.message` → `PHASE_REQUEST`):
+  - Preconditions: a request-phase policy that DENYs (e.g. a prompt-injection /
+    PII rule), or "Require Approval" set to ASK on prompts.
+  - Steps: type a prompt **in the opencode TUI** that trips it.
+  - Expected: a DENY **aborts the turn** before the model runs (the true
+    prompt-submit block that was missing); an ASK parks the web approval card and
+    blocks the turn until resolved. A web-injected prompt is **not** re-gated here
+    (the server auto-allows it — already gated at injection; no double-prompt).
+- **TOOL_RESULT phase** (`tool.execute.after` → `PHASE_TOOL_RESULT`):
+  - Preconditions: a tool-result policy that DENYs (e.g. redact on a sensitive
+    classification label).
+  - Steps: have the model call a tool whose output trips it.
+  - Expected: the model receives `[Omnigent policy: tool result withheld]`
+    instead of the real output (the tool already ran; its result is withheld).
+- Fail-open: with the Omnigent server unreachable, prompts/tools still flow
+  (transport errors fail open — confirm no lockout), and enforcement resumes when
+  the server returns.
+- Known limit: the plugin's auth token is a launch snapshot; on a long
+  gateway/remote session it can expire → enforcement silently degrades to
+  fail-open. (Local/no-auth dev is unaffected.) Refreshable-token follow-up.
 
 ---
 
