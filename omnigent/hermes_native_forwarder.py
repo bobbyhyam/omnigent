@@ -148,9 +148,7 @@ class _HermesUsageTracker:
     async def flush(self) -> None:
         """Post the model name if it changed since the last flush."""
         if self._model is None:
-            self._model = await asyncio.to_thread(
-                _read_model_from_hermes_config, self._bridge_dir
-            )
+            self._model = await asyncio.to_thread(_read_model_from_hermes_config, self._bridge_dir)
         if not self._model or self._model == self._posted_model:
             return
         try:
@@ -164,9 +162,7 @@ class _HermesUsageTracker:
             if resp.status_code < 400:
                 self._posted_model = self._model
             else:
-                _logger.warning(
-                    "hermes usage tracker POST failed: status=%s", resp.status_code
-                )
+                _logger.warning("hermes usage tracker POST failed: status=%s", resp.status_code)
         except httpx.HTTPError:
             _logger.debug("hermes usage tracker POST failed", exc_info=True)
 

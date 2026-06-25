@@ -7845,6 +7845,8 @@ def create_runner_app(
             if harness_name == "hermes-native" and spawn_env is None:
                 from omnigent.hermes_native_bridge import (
                     bridge_dir_for_session_id as _hermes_bridge_dir,
+                )
+                from omnigent.hermes_native_bridge import (
                     build_hermes_native_spawn_env,
                     write_policy_hook_config,
                 )
@@ -7852,9 +7854,7 @@ def create_runner_app(
                 _h_server_url = os.environ.get(
                     "RUNNER_SERVER_URL", "http://localhost:6767"
                 ).rstrip("/")
-                write_policy_hook_config(
-                    _hermes_bridge_dir(session_id), _h_server_url, session_id
-                )
+                write_policy_hook_config(_hermes_bridge_dir(session_id), _h_server_url, session_id)
                 spawn_env = build_hermes_native_spawn_env(session_id)
             if harness_name == "qwen-native" and spawn_env is None:
                 from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
@@ -12578,16 +12578,16 @@ def create_runner_app(
         if harness_name == "hermes-native" and spawn_env is None:
             from omnigent.hermes_native_bridge import (
                 bridge_dir_for_session_id as _hermes_bridge_dir2,
+            )
+            from omnigent.hermes_native_bridge import (
                 build_hermes_native_spawn_env,
                 write_policy_hook_config,
             )
 
-            _h_server_url2 = os.environ.get(
-                "RUNNER_SERVER_URL", "http://localhost:6767"
-            ).rstrip("/")
-            write_policy_hook_config(
-                _hermes_bridge_dir2(conv_id), _h_server_url2, conv_id
+            _h_server_url2 = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip(
+                "/"
             )
+            write_policy_hook_config(_hermes_bridge_dir2(conv_id), _h_server_url2, conv_id)
             spawn_env = build_hermes_native_spawn_env(conv_id)
         if harness_name == "qwen-native" and spawn_env is None:
             from omnigent.qwen_native_bridge import build_qwen_native_spawn_env

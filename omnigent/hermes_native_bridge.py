@@ -158,9 +158,7 @@ def write_policy_hook_config(
     hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
     hermes_home.mkdir(parents=True, exist_ok=True)
 
-    hook_script_path = str(
-        Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py"
-    )
+    hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
 
     # Wrapper shell script: sets env vars and execs the Python hook.
     wrapper = hermes_home / "omnigent-policy-hook.sh"
@@ -197,9 +195,11 @@ def write_policy_hook_config(
         "omnigent": {
             "command": sys.executable,
             "args": [
-                "-m", "omnigent.claude_native_bridge",
+                "-m",
+                "omnigent.claude_native_bridge",
                 "serve-mcp",
-                "--bridge-dir", str(bridge_dir),
+                "--bridge-dir",
+                str(bridge_dir),
             ],
         },
     }

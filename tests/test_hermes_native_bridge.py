@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -152,12 +151,12 @@ def test_inject_compress_command_sends_keys(tmp_path, monkeypatch) -> None:
         calls.append(args)
 
     monkeypatch.setattr(b, "_run_tmux", _fake_tmux)
-    monkeypatch.setattr(
-        b, "read_tmux_info", lambda _d: {"socket_path": "/s", "tmux_target": "t"}
-    )
+    monkeypatch.setattr(b, "read_tmux_info", lambda _d: {"socket_path": "/s", "tmux_target": "t"})
     # _wait_for_tmux_info calls read_tmux_info internally, so patch it.
     monkeypatch.setattr(
-        b, "_wait_for_tmux_info", lambda _d, timeout_s=30: {"socket_path": "/s", "tmux_target": "t"}
+        b,
+        "_wait_for_tmux_info",
+        lambda _d, timeout_s=30: {"socket_path": "/s", "tmux_target": "t"},
     )
     b.inject_compress_command(tmp_path)
     assert calls == [
@@ -180,9 +179,7 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    hermes_home = b.write_policy_hook_config(
-        bridge_dir, "http://localhost:6767", "session-123"
-    )
+    hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "session-123")
 
     assert hermes_home == bridge_dir / "hermes_home"
     assert hermes_home.is_dir()
@@ -268,9 +265,7 @@ def test_read_hermes_home_returns_none_when_missing(tmp_path) -> None:
     assert b.read_hermes_home(tmp_path) is None
 
 
-def test_build_spawn_env_includes_hermes_home_when_policy_written(
-    tmp_path, monkeypatch
-) -> None:
+def test_build_spawn_env_includes_hermes_home_when_policy_written(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(b, "_BRIDGE_ROOT", tmp_path / "hermes-native")
     bridge_dir = b.bridge_dir_for_session_id("test-session")
     bridge_dir.mkdir(parents=True, exist_ok=True)
