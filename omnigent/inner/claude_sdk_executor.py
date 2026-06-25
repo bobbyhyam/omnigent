@@ -2562,7 +2562,7 @@ class ClaudeSDKExecutor(Executor):
                 # EVERY later resume of this conversation. The runner persists a
                 # compaction item with no ``compacted_messages``, so resume
                 # replays the lossy synthetic-summary pair instead of the
-                # harness's real post-compaction context (OMNI-143). Surface it.
+                # harness's real post-compaction context. Surface it.
                 logger.warning(
                     "Failed to read Claude post-compaction session messages "
                     "(session=%s); resume fidelity for this conversation will "

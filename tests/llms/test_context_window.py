@@ -398,7 +398,7 @@ def test_get_model_context_window_uses_registry_first(monkeypatch: pytest.Monkey
 
     Catalog lookup is disabled to prove hermeticity: the registry is consulted
     before litellm and the catalog, so qwen models and the Anthropic ``[1m]``
-    beta resolve correctly even offline (the OMNI-142 meter / OMNI-143 overflow
+    beta resolve correctly even offline (the meter / overflow-threshold
     bug was that these collapsed to the 128K default).
     """
     monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
