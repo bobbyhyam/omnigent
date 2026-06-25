@@ -69,95 +69,184 @@ def test_block_hash_differs_per_tool_and_id_is_deterministic() -> None:
     assert eid.startswith("elicit_goose_conv_9_")
 
 
-# --- mirror plumbing (web verdict → cliclack keystrokes; TUI answer → release) -
+# --- policy enforcement (store read → /policies/evaluate verdict → cliclack) ---
+
+
+import re  # noqa: E402 — local to the plumbing tests below
+
+from omnigent.goose_native_forwarder import PendingToolCall  # noqa: E402
 
 
 class _Resp:
-    def __init__(self, status: int = 200, content: bytes = b'{"action":"accept"}', payload=None):
+    def __init__(self, status: int = 200, content: bytes | None = None, payload=None):
         self.status_code = status
-        self.content = content
-        self._payload = payload if payload is not None else {"action": "accept"}
-        self.text = content.decode() if isinstance(content, bytes) else str(content)
+        self._payload = payload
+        if content is not None:
+            self.content = content
+        elif payload is not None:
+            import json as _json
+
+            self.content = _json.dumps(payload).encode()
+        else:
+            self.content = b""
+        self.text = self.content.decode() if isinstance(self.content, bytes) else str(self.content)
 
     def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
         return self._payload
 
 
-class _FakeClient:
-    def __init__(self, resp: _Resp) -> None:
-        self._resp = resp
+class _RoutingClient:
+    """Fake httpx client that routes a POST to a response by URL substring."""
+
+    def __init__(self, routes: dict[str, _Resp], *, raise_on: str | None = None) -> None:
+        self._routes = routes
+        self._raise_on = raise_on
         self.posts: list[tuple[str, dict]] = []
 
     async def post(self, url, json=None, **_kwargs):
         self.posts.append((url, json or {}))
-        return self._resp
+        if self._raise_on is not None and self._raise_on in url:
+            import httpx
+
+            raise httpx.ConnectError("boom")
+        for sub, resp in self._routes.items():
+            if sub in url:
+                return resp
+        raise AssertionError(f"no fake route for {url}")
 
 
 def _gprompt(deny_downs: int = 2) -> gp.GooseApprovalPrompt:
     return gp.GooseApprovalPrompt(
-        subject="developer__shell rm -rf x",
+        subject="shell rm -rf x",
         message="m",
-        preview="developer__shell",
+        preview="shell",
         deny_down_count=deny_downs,
         block_hash="h",
     )
 
 
-async def test_run_one_approval_accept_presses_enter(tmp_path, monkeypatch) -> None:
-    sent: list[tuple] = []
-    monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
+def _call(name: str = "shell", args: dict | None = None) -> PendingToolCall:
+    return PendingToolCall(
+        request_id="t1",
+        name=name,
+        arguments=args if args is not None else {"command": "ls"},
+        extension="developer",
+    )
+
+
+async def _run(client, tmp_path, *, prompt=None, holder=None):
+    """Invoke ``_run_one_approval`` with the structured-read path wired up."""
     await gp._run_one_approval(
-        _FakeClient(_Resp(payload={"action": "accept"})),
+        client,
         session_id="c",
         bridge_dir=tmp_path,
-        prompt=_gprompt(),
-        elicitation_id="e1",
+        prompt=prompt or _gprompt(),
+        db_path=tmp_path,
+        goose_session_id="gs1",
+        episode=1,
+        holder=holder if holder is not None else {},
     )
+
+
+def test_evaluate_elicitation_id_matches_server_contract() -> None:
+    eid = gp._evaluate_elicitation_id("conv_9", 3)
+    assert eid == gp._evaluate_elicitation_id("conv_9", 3)  # deterministic
+    assert re.fullmatch(r"elicit_evaluate_[0-9a-f]{32}", eid)
+
+
+async def test_policy_allow_presses_enter_and_posts_tool_call(tmp_path, monkeypatch) -> None:
+    sent: list[tuple] = []
+    monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
+    monkeypatch.setattr(gp, "read_pending_tool_request", lambda *a, **k: _call())
+    client = _RoutingClient(
+        {"/policies/evaluate": _Resp(payload={"result": "POLICY_ACTION_ALLOW"})}
+    )
+    await _run(client, tmp_path)
     assert sent == [("Enter",)]  # Allow is the default-highlighted item
+    url, body = client.posts[0]
+    assert url.endswith("/policies/evaluate")
+    assert body["event"]["type"] == "PHASE_TOOL_CALL"
+    assert body["event"]["data"] == {"name": "shell", "arguments": {"command": "ls"}}
+    assert body["_omnigent_elicitation_id"].startswith("elicit_evaluate_")
 
 
-async def test_run_one_approval_decline_walks_to_deny(tmp_path, monkeypatch) -> None:
+async def test_policy_unspecified_allows(tmp_path, monkeypatch) -> None:
     sent: list[tuple] = []
     monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
-    await gp._run_one_approval(
-        _FakeClient(_Resp(payload={"action": "decline"})),
-        session_id="c",
-        bridge_dir=tmp_path,
-        prompt=_gprompt(deny_downs=2),
-        elicitation_id="e1",
+    monkeypatch.setattr(gp, "read_pending_tool_request", lambda *a, **k: _call())
+    client = _RoutingClient(
+        {"/policies/evaluate": _Resp(payload={"result": "POLICY_ACTION_UNSPECIFIED"})}
     )
+    await _run(client, tmp_path)
+    assert sent == [("Enter",)]  # no agent / no policy matched → let it run
+
+
+async def test_policy_deny_walks_to_deny(tmp_path, monkeypatch) -> None:
+    sent: list[tuple] = []
+    monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
+    monkeypatch.setattr(gp, "read_pending_tool_request", lambda *a, **k: _call())
+    client = _RoutingClient(
+        {"/policies/evaluate": _Resp(payload={"result": "POLICY_ACTION_DENY"})}
+    )
+    await _run(client, tmp_path, prompt=_gprompt(deny_downs=2))
     assert sent == [("Down", "Down", "Enter")]  # Allow → Always Allow → Deny
 
 
-async def test_run_one_approval_empty_and_error_send_nothing(tmp_path, monkeypatch) -> None:
+async def test_policy_http_error_fails_closed_to_deny(tmp_path, monkeypatch) -> None:
     sent: list[tuple] = []
     monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
-    await gp._run_one_approval(
-        _FakeClient(_Resp(content=b"")),
-        session_id="c",
-        bridge_dir=tmp_path,
-        prompt=_gprompt(),
-        elicitation_id="e1",
+    monkeypatch.setattr(gp, "read_pending_tool_request", lambda *a, **k: _call())
+    client = _RoutingClient({"/policies/evaluate": _Resp(status=503, content=b"down")})
+    await _run(client, tmp_path, prompt=_gprompt(deny_downs=1))
+    assert sent == [("Down", "Enter")]  # fail closed → Deny
+
+
+async def test_policy_transport_error_fails_closed_to_deny(tmp_path, monkeypatch) -> None:
+    sent: list[tuple] = []
+    monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
+    monkeypatch.setattr(gp, "read_pending_tool_request", lambda *a, **k: _call())
+    client = _RoutingClient({}, raise_on="/policies/evaluate")
+    await _run(client, tmp_path, prompt=_gprompt(deny_downs=1))
+    assert sent == [("Down", "Enter")]  # transport failure → fail closed → Deny
+
+
+async def test_no_pending_tool_falls_back_to_blind_ask(tmp_path, monkeypatch) -> None:
+    sent: list[tuple] = []
+    monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
+    monkeypatch.setattr(gp, "read_pending_tool_request", lambda *a, **k: None)
+    monkeypatch.setattr(gp, "_PENDING_READ_RETRIES", 1)
+    monkeypatch.setattr(gp, "_PENDING_READ_RETRY_DELAY_S", 0.0)
+    client = _RoutingClient(
+        {"/hooks/native-permission-request": _Resp(payload={"action": "accept"})}
     )
-    await gp._run_one_approval(
-        _FakeClient(_Resp(status=503, content=b"down")),
-        session_id="c",
-        bridge_dir=tmp_path,
-        prompt=_gprompt(),
-        elicitation_id="e1",
-    )
+    await _run(client, tmp_path)
+    assert sent == [("Enter",)]
+    assert client.posts[0][0].endswith("/hooks/native-permission-request")
+
+
+async def test_blind_ask_external_resolution_drives_nothing(tmp_path, monkeypatch) -> None:
+    sent: list[tuple] = []
+    monkeypatch.setattr(gp, "send_goose_pane_keys", lambda _bd, *keys: sent.append(keys))
+    monkeypatch.setattr(gp, "read_pending_tool_request", lambda *a, **k: None)
+    monkeypatch.setattr(gp, "_PENDING_READ_RETRIES", 1)
+    monkeypatch.setattr(gp, "_PENDING_READ_RETRY_DELAY_S", 0.0)
+    # Empty body = resolved in the TUI / timed out → no drive.
+    client = _RoutingClient({"/hooks/native-permission-request": _Resp(content=b"")})
+    await _run(client, tmp_path)
     assert sent == []
 
 
 async def test_post_external_elicitation_resolved_targets_events(tmp_path) -> None:
-    client = _FakeClient(_Resp(status=200, content=b""))
+    client = _RoutingClient({"/events": _Resp(status=200, content=b"")})
     await gp._post_external_elicitation_resolved(client, "conv_g", "e3")
     url, body = client.posts[0]
     assert url == "/v1/sessions/conv_g/events"
     assert body["type"] == "external_elicitation_resolved"
 
 
-async def test_supervise_raises_one_card_per_episode(tmp_path, monkeypatch) -> None:
+async def test_supervise_one_episode_per_prompt(tmp_path, monkeypatch) -> None:
     panes = [_THREE_ITEM, _THREE_ITEM, None]
     seq = {"i": 0}
 
@@ -167,10 +256,13 @@ async def test_supervise_raises_one_card_per_episode(tmp_path, monkeypatch) -> N
         return panes[i] if i < len(panes) else None
 
     monkeypatch.setattr(gp, "capture_goose_pane", _cap)
-    created: list[str] = []
+    monkeypatch.setattr(gp, "_resolve_goose_session_id", lambda _db, _name: "gs1")
+    created: list[int] = []
 
-    async def _fake_run_one(_client, *, session_id, bridge_dir, prompt, elicitation_id):
-        created.append(elicitation_id)
+    async def _fake_run_one(
+        _client, *, session_id, bridge_dir, prompt, db_path, goose_session_id, episode, holder
+    ):
+        created.append(episode)
 
     monkeypatch.setattr(gp, "_run_one_approval", _fake_run_one)
 
@@ -185,6 +277,10 @@ async def test_supervise_raises_one_card_per_episode(tmp_path, monkeypatch) -> N
 
     with pytest.raises(asyncio.CancelledError):
         await gp.supervise_goose_approval_mirror(
-            base_url="http://x", headers={}, session_id="c", bridge_dir=tmp_path
+            base_url="http://x",
+            headers={},
+            session_id="c",
+            bridge_dir=tmp_path,
+            goose_session_name="c-123",
         )
     assert len(created) == 1

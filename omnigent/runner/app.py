@@ -1977,14 +1977,17 @@ async def _auto_create_goose_terminal(
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     goose_command = resolve_goose_executable()
-    # GOOSE_MODE=smart_approve so Goose prompts in its TUI before sensitive tools
-    # (its native approval, which shows in the terminal and the web's embedded
-    # terminal). Goose's default mode is Auto (no prompt), so we set this for the
-    # approval flow to appear at all. Provider/model come from `goose configure`.
+    # GOOSE_MODE=approve so Goose prompts in its TUI before EVERY tool. This is
+    # required for complete Omnigent-policy interception: smart_approve lets Goose
+    # auto-allow "safe" tools WITHOUT prompting, and those calls would bypass the
+    # approval mirror (and thus Omnigent policy). With `approve`, every tool stops
+    # at the cliclack gate, which the mirror drives from the Omnigent policy
+    # verdict (see :mod:`omnigent.goose_native_permissions`). Provider/model come
+    # from `goose configure`.
     goose_env: dict[str, str] = {
         "GOOSE_CLI_THEME": "ansi",
         "GOOSE_TELEMETRY_OFF": "1",
-        "GOOSE_MODE": "smart_approve",
+        "GOOSE_MODE": "approve",
     }
     # Launch-unique Goose session name. `goose session --name X` (without
     # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
@@ -2082,6 +2085,7 @@ async def _auto_create_goose_terminal(
                 headers={},
                 session_id=session_id,
                 bridge_dir=bridge_dir,
+                goose_session_name=goose_session_name,
                 auth=_runner_auth,
             ),
         )

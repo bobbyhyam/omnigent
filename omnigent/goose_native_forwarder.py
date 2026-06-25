@@ -177,6 +177,144 @@ def _resolve_goose_session_id(db_path: Path, session_name: str) -> str | None:
     return row[0] if row and isinstance(row[0], str) else None
 
 
+@dataclass(frozen=True)
+class PendingToolCall:
+    """A goose tool call awaiting in-terminal approval, read from the store.
+
+    Goose persists the assistant message (carrying its ``toolRequest`` parts)
+    *before* it blocks on the cliclack confirmation (verified against goose's
+    reply loop: the message is added to the store, then the ``ToolConfirmation``
+    is emitted), so the structured call is readable at prompt time — no scraping
+    the tool name/args off the pane.
+
+    :param request_id: The goose tool-request id (correlates to a later
+        ``toolResponse`` once executed or denied).
+    :param name: The bare tool name (e.g. ``shell``), as goose stores it.
+    :param arguments: The tool arguments object.
+    :param extension: The owning goose extension (``_meta.goose_extension``),
+        used to recognise Omnigent-MCP tools that the relay already gates.
+    """
+
+    request_id: str
+    name: str
+    arguments: dict[str, object]
+    extension: str | None
+
+
+def _tool_request_from_part(part: object) -> PendingToolCall | None:
+    """Parse one ``{"type":"toolRequest",...}`` content part, or ``None``.
+
+    Shape (verified against a live ``sessions.db``)::
+
+        {"type":"toolRequest","id":"toolu_…",
+         "toolCall":{"status":"success","value":{"name":"shell",
+                     "arguments":{"command":"…"}}},
+         "_meta":{"goose_extension":"developer"}}
+    """
+    if not isinstance(part, dict) or part.get("type") != "toolRequest":
+        return None
+    request_id = part.get("id")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    call = part.get("toolCall")
+    # ``toolCall`` is a serialized ``Result``; only a success carries name/args.
+    if not isinstance(call, dict) or call.get("status") != "success":
+        return None
+    value = call.get("value")
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    arguments = value.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+    extension = None
+    meta = part.get("_meta")
+    if isinstance(meta, dict):
+        ext = meta.get("goose_extension")
+        if isinstance(ext, str) and ext:
+            extension = ext
+    return PendingToolCall(
+        request_id=request_id, name=name, arguments=arguments, extension=extension
+    )
+
+
+def _response_ids_from_content(content_json: str) -> set[str]:
+    """Return the set of ``toolResponse`` ids in a ``content_json`` value."""
+    try:
+        obj = json.loads(content_json)
+    except ValueError:
+        return set()
+    parts = obj if isinstance(obj, list) else [obj]
+    ids: set[str] = set()
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "toolResponse":
+            rid = part.get("id")
+            if isinstance(rid, str) and rid:
+                ids.add(rid)
+    return ids
+
+
+def read_pending_tool_request(
+    db_path: Path, goose_session_id: str, *, scan_limit: int = 60
+) -> PendingToolCall | None:
+    """Return the tool call goose is currently blocked on, or ``None``.
+
+    The pending tool is the ``toolRequest`` that has no matching ``toolResponse``
+    yet (every executed *or denied* tool gets a response carrying the same id,
+    so "unresponded" means "awaiting the approval gate"). Goose prompts per tool
+    in order, so among unresponded requests the active one is the latest message
+    and, within it, the earliest part — we sort ``(msg_id desc, part_index asc)``
+    and take the first. In the overwhelmingly common single-tool turn there is
+    exactly one unresponded request, so the ordering is moot.
+
+    Only the most recent ``scan_limit`` messages are scanned: the pending
+    request and any sibling responses from the same turn are always recent.
+
+    :param db_path: Goose sessions DB path.
+    :param goose_session_id: The resolved ``sessions.id`` to scan.
+    :param scan_limit: How many trailing messages to inspect.
+    :returns: The pending :class:`PendingToolCall`, or ``None`` if none is
+        awaiting approval (or the store is momentarily unreadable).
+    """
+    con = _connect_ro(db_path)
+    if con is None:
+        return None
+    try:
+        rows = con.execute(
+            "SELECT id, role, content_json FROM messages "
+            "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (goose_session_id, scan_limit),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("pending tool read", exc)
+        return None
+    finally:
+        con.close()
+    responded: set[str] = set()
+    # (msg_id, part_index, call) for every parseable toolRequest in the window.
+    requests: list[tuple[int, int, PendingToolCall]] = []
+    for msg_id, _role, content_json in rows:
+        if not isinstance(content_json, str):
+            continue
+        responded |= _response_ids_from_content(content_json)
+        try:
+            obj = json.loads(content_json)
+        except ValueError:
+            continue
+        parts = obj if isinstance(obj, list) else [obj]
+        for idx, part in enumerate(parts):
+            call = _tool_request_from_part(part)
+            if call is not None and isinstance(msg_id, int):
+                requests.append((msg_id, idx, call))
+    pending = [(mid, idx, c) for (mid, idx, c) in requests if c.request_id not in responded]
+    if not pending:
+        return None
+    pending.sort(key=lambda t: (-t[0], t[1]))
+    return pending[0][2]
+
+
 @dataclass
 class _MirrorItem:
     """One conversation item ready to POST, plus the message id that produced it."""
