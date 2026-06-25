@@ -25,6 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
@@ -68,6 +69,53 @@ _DATABRICKS_ANTHROPIC_GATEWAY_PATH = "/ai-gateway/anthropic"
 # base_url; pi-native rewrites it to the Anthropic surface Pi speaks natively.
 _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
+
+# Trusted parent domain suffixes for a Databricks-owned host. The AI Gateway
+# lives under a per-workspace subdomain of one of these (the canonical form is
+# ``<workspace>.ai-gateway.cloud.databricks.com``); the Azure / GCP control
+# planes serve workspaces under their own parent domains. We anchor on the
+# leading "." so a look-alike like ``...cloud.databricks.com.evil.test`` (which
+# ends in ``.evil.test``) is rejected.
+_DATABRICKS_TRUSTED_HOST_SUFFIXES = (
+    ".cloud.databricks.com",  # AWS workspaces + ai-gateway (incl. *.staging.cloud.databricks.com)
+    ".azuredatabricks.net",  # Azure Databricks
+    ".gcp.databricks.com",  # GCP Databricks
+)
+
+# A genuine AI Gateway host carries the ``ai-gateway`` DNS label; we require it
+# (alongside a trusted suffix) so a non-gateway Databricks host isn't routed as
+# the gateway's Anthropic surface.
+_DATABRICKS_AI_GATEWAY_LABEL = "ai-gateway"
+
+
+def _is_databricks_ai_gateway_url(base_url: str) -> bool:
+    """Return ``True`` only for a genuine Databricks AI Gateway base URL.
+
+    Hardens the old substring scan over the whole base_url (scheme+host+path),
+    which look-alikes such as ``https://databricks-ai-gateway.evil.test/...``,
+    ``https://x.cloud.databricks.com.evil.test/...`` or
+    ``https://evil.test/databricks/ai-gateway/v1`` all defeated — leaking the
+    workspace bearer token to an attacker-controlled host. We parse the URL and
+    validate the *hostname* (not the raw string): require an ``https`` scheme, a
+    resolvable hostname carrying the ``ai-gateway`` DNS label, and a hostname
+    that ends with a trusted Databricks-owned parent domain suffix.
+
+    :param base_url: The codex provider table's ``base_url``.
+    :returns: ``True`` iff the URL is an https Databricks AI Gateway endpoint.
+    """
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https":
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    hostname = hostname.lower()
+    # ``ai-gateway`` must be a full DNS label, not a substring of one (so
+    # ``databricks-ai-gateway.evil.test`` does not qualify on the label alone).
+    labels = hostname.split(".")
+    if _DATABRICKS_AI_GATEWAY_LABEL not in labels:
+        return False
+    return any(hostname.endswith(suffix) for suffix in _DATABRICKS_TRUSTED_HOST_SUFFIXES)
 
 
 @dataclass(frozen=True)
@@ -203,12 +251,12 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             entry.model_provider,
         )
         return None
-    # Identify the Databricks AI Gateway robustly (not by workspace id): the
-    # codex base_url points at the AI Gateway host. We accept any gateway-shaped
-    # base_url — the canonical Databricks form is "*.ai-gateway.*databricks*".
-    host = transport.base_url
-    is_databricks_gateway = "databricks" in host.lower() and "ai-gateway" in host.lower()
-    if not is_databricks_gateway:
+    # Identify the Databricks AI Gateway robustly (not by workspace id): parse
+    # the codex base_url and validate its *hostname* against a trusted
+    # Databricks domain suffix allowlist plus the ``ai-gateway`` DNS label — a
+    # substring scan over the whole base_url would forward the workspace bearer
+    # token to look-alike hosts (e.g. ``databricks-ai-gateway.evil.test``).
+    if not _is_databricks_ai_gateway_url(transport.base_url):
         _LOGGER.info(
             "pi-native: cli-config provider %r (model_provider %r, base_url %r) is not a "
             "recognized Databricks AI Gateway; Pi will use its own login.",
