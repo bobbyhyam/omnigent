@@ -1862,29 +1862,59 @@ def resume_test_server(
 # liveness-probe fix in place this should stay silent (count 0). Remove once the
 # leak is confirmed fixed.
 # ---------------------------------------------------------------------------
-def _live_tmux_server_count() -> int:
+def _terminal_leak_report() -> str | None:
+    """Count live tmux servers + classify terminal instance dirs by owner.
+
+    The owner-liveness split is the key diagnostic: ``owner_alive`` dirs mean
+    the per-session teardown (``_teardown_session_terminals`` -> kill-server)
+    never fired for a still-owned terminal; ``owner_dead`` dirs mean the owner
+    exited ungracefully and the startup ``reap_orphaned_terminals`` sweep is not
+    catching them. Returns None when there is nothing to report.
+    """
     try:
         import psutil
-    except Exception:
-        return -1
-    count = 0
+
+        from omnigent.inner import terminal as _term
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        return f"(leakcheck unavailable: {exc!r})"
+    tmux = 0
     for proc in psutil.process_iter(["name"]):
         try:
             if (proc.info["name"] or "").startswith("tmux"):
-                count += 1
+                tmux += 1
         except Exception:
             continue
-    return count
+    if tmux <= 0:
+        return None
+    alive = dead = no_marker = 0
+    try:
+        entries = list(_term._terminals_tmp_root().glob(f"{_term._TERMINAL_DIR_PREFIX}*"))
+    except Exception:
+        entries = []
+    for entry in entries:
+        try:
+            pid = int((entry / _term._OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            no_marker += 1
+            continue
+        if _term._process_alive(pid):
+            alive += 1
+        else:
+            dead += 1
+    return (
+        f"tmux_servers={tmux} "
+        f"term_dirs(owner_alive={alive} owner_dead={dead} no_marker={no_marker})"
+    )
 
 
 @pytest.fixture(autouse=True)
 def _leakcheck_tmux_servers(request: Any) -> Iterator[None]:
     yield
-    count = _live_tmux_server_count()
-    if count <= 0:
+    report = _terminal_leak_report()
+    if report is None:
         return
     capman = request.config.pluginmanager.getplugin("capturemanager")
-    line = f"[LEAKCHECK] live tmux servers={count} after {request.node.nodeid}"
+    line = f"[LEAKCHECK] {report} after {request.node.nodeid}"
     if capman is not None:
         capman.suspend_global_capture(in_=False)
     try:
