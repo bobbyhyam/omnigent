@@ -77,7 +77,7 @@ Gap-matrix verdicts for the opencode row (✓ = works, ✗ = missing, ? = unknow
 | Model override | ✓ | works (per-prompt) |
 | Streaming (forwarder) | complete-only | by design for native-server |
 | Elicitation (web) | ✓ | **solid** (verified) + a separate `question.asked` surface — foundation landed, web round-trip is a follow-up |
-| Policies | ? | **YES, wired** to the TOOL_CALL engine (reactive); force-`ask` makes it cover MCP + relay tools too |
+| Policies | ? | **Partial** — TOOL_CALL-phase only (reactive via `permission.asked`). Name-agnostic policies (rate-limit, cost-budget, allow/deny-all) work; tool-name-targeted ones were silently bypassed until the parse fix (the action was read as the literal `"permission"`). REQUEST/PROMPT-phase + TOOL_RESULT-phase policies do **not** fire (opencode has no prompt-submit / post-tool hook). Per-policy name-set coverage still partial — see the policy-coverage note |
 | Cost tracking (P1) | ? | was missing → **built** (`external_session_usage`) |
 | Interrupt | ✓ | works (abort) |
 | Bidirectional sync (TUI→Omni) | ✓ | works |
@@ -180,7 +180,11 @@ All land in `opencode_native_forwarder.py` / `opencode_native_provider.py` /
 
 ### 7. Elicitation (verify) + Policies (verify/harden)
 - **Elicitation:** ✓ solid (full permission.v2 round-trip, fail-closed, tested). Harden: (C1) the typed `transport.reply_permission` is dead code parallel to the live forwarder path — unify or delete to prevent drift; (C2) a failed `POST .../reply` is swallowed → opencode-side hang — retry/reconcile via `GET /session/{id}/permission`. **New (C3):** handle the separate `question.asked` input-request surface (currently ignored) as a form elicitation — **foundation landed** (`reply_question`/`reject_question`, live-verified + tested); the forwarder handler + server form-hook + TUI race guard remain (see the bonus section). Effort S (C1) / M (C2, C3).
-- **Policies:** ✓ wired (allow/deny/ask all honored). Reactive only — coverage bounded by opencode's permission surface; no pre-tool hook, no TOOL_RESULT phase. Force-ask via the synthesized config (clarification 2) closes the coverage hole; document the reactive model. Effort S.
+- **Policies:** wired to the TOOL_CALL engine (allow/deny/ask honored), reactive via `permission.asked`. Honest coverage limits (audited after the file/shell-approval bug):
+  - **Phase:** only TOOL_CALL (pre-execution) fires. opencode has **no prompt-submit hook** (claude's `UserPromptSubmit`) and **no post-tool hook**, so REQUEST/PROMPT-phase policies (prompt-injection, PII-in-prompt, per-prompt cost) and TOOL_RESULT-phase policies (gate/redact tool output) do **not** enforce. Same root as the cost-budget "tool-call-phase only" caveat.
+  - **Tool name:** opencode's `permission.asked` carries the action in `permission` (v1) as a CATEGORY (`bash`/`edit`/`read`/`grep`/`glob`/`skill`/`webfetch`/…). The parser read only `action`/`type`, so the policy tool name was the literal `"permission"` and **no tool-name-targeted policy matched** (file/shell approval, skill block, github/google gating all silently ALLOWed). Fixed: parser reads `permission`/`patterns`; `ask_on_os_tools` gained the opencode categories.
+  - **Per-policy name-set gaps still open:** `block_skills` doesn't recognize opencode's `skill` category (and the skill name rides in `patterns`, not the forwarded args — Omnigent `load_skill` via the relay IS covered); the github/google policies gate shell commands via a default `sys_os_shell`-only set (misses every native harness's shell tool — broad/config-dependent, not opencode-specific); `risk_score`'s risk table is keyed by canonical names, so opencode categories score as default.
+  - Name-agnostic policies (rate-limit, cost-budget, allow/deny-all) were unaffected throughout.
 
 ## Recommended sequence
 
