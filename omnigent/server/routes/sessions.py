@@ -91,6 +91,7 @@ from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
+    CURSOR_NATIVE_CODING_AGENT,
     NativeCodingAgent,
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -193,6 +194,7 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
     AgentObject,
+    ChildSessionList,
     ChildSessionSummary,
     CompletedEvent,
     ConversationDeleted,
@@ -210,6 +212,8 @@ from omnigent.server.schemas import (
     PaginatedList,
     PermissionObject,
     PolicySummary,
+    ReasoningStartedEvent,
+    ReasoningTextDeltaEvent,
     ResponseObject,
     SandboxStatus,
     ServerStreamEvent,
@@ -226,6 +230,7 @@ from omnigent.server.schemas import (
     SessionInterruptedEvent,
     SessionInterruptedPayload,
     SessionLabelsResponse,
+    SessionList,
     SessionListItem,
     SessionModelEvent,
     SessionModelOptionsEvent,
@@ -323,6 +328,17 @@ _EXTERNAL_CONVERSATION_ITEM_TYPE: str = "external_conversation_item"
 # corresponding completed message still arrives later via
 # ``external_conversation_item``.
 _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE: str = "external_output_text_delta"
+
+# Internal input used by terminal-backed integrations to publish a transient
+# reasoning (chain-of-thought) delta observed before the completed message is
+# available — the reasoning analogue of ``external_output_text_delta``. Nothing
+# is persisted: it publishes ``response.reasoning_text.delta`` (preceded by a
+# single ``response.reasoning.started`` when ``data.started`` is true) so the SPA
+# paints a live reasoning block, matching the in-process executor's wire shape.
+# Reasoning has no completed conversation item; the block is finalized when the
+# assistant message arrives via ``external_conversation_item``. Payload:
+# ``{"delta": "...", "started": true|false}``.
+_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE: str = "external_output_reasoning_delta"
 
 # Internal input used by terminal-backed integrations to publish an
 # explicit ``session.interrupted`` edge observed outside the Omnigent
@@ -496,6 +512,7 @@ _CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
+_CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -683,6 +700,21 @@ def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
 # any prompt a headless sub-agent left unanswered for >5 minutes.
 _CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 
+# Antigravity (agy) elicitation hook wait budget. Same 24-hour cap as
+# Codex: a terminal-side verdict (or agy's own WAITING timeout) ends the
+# wait early, so the long park never blocks native-TUI paths.
+_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
+# Same one-day park budget for cursor-native tool-approval prompts mirrored
+# from the TUI: a terminal-side answer ends the wait early via
+# ``external_elicitation_resolved`` (posted by the runner-side approval mirror),
+# so the long park never blocks the cursor pane.
+_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
+
+# Same one-day park budget for the generic native-permission hook used by the
+# hermes- and goose-native approval mirrors (TUI prompt → web card). A
+# terminal-side answer ends the wait early via ``external_elicitation_resolved``.
+_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
+
 # ``external_elicitation_resolved`` can arrive just before the matching
 # Codex hook registers, and a web verdict can land between a severed
 # long-poll and its retry. Pinned, NOT the hook wait budget: Codex ids
@@ -699,8 +731,11 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 
 # Client-supplied re-attach ids, namespaced so they cannot collide
-# with Codex deterministic ids or server-minted ids.
-_CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# with Codex deterministic ids or server-minted ids. The shared
+# PermissionRequest endpoint is used by every native-CLI wrapper that mints its
+# own id (claude-native ``elicit_claude_…``, kimi-native ``elicit_kimi_…``), so
+# the namespace is the harness token, not a fixed ``claude``.
+_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 # Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
 # server to re-park the existing ASK elicitation rather than minting a new
 # approval card when a transient 5xx or connect-drop triggered a retry.
@@ -754,6 +789,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+    _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
@@ -1418,6 +1454,27 @@ async def _publish_and_wait_for_harness_elicitation(
                 )
 
 
+def _canonical_tool_input(tool_input: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    Canonicalize a tool input for terminal-resolved correlation.
+
+    The park side records an absent / non-dict input as ``None`` (a
+    permission prompt whose hook payload carries no ``tool_input`` — see
+    the ``_publish_and_wait_for_harness_elicitation`` call sites), while
+    the mirror side normalizes the parsed transcript arguments to ``{}``
+    (see :func:`_drive_terminal_resolved_elicitation`). Both mean "no
+    input", so collapse them to ``{}`` before comparing — otherwise a
+    no-input prompt would never match its own mirrored result (``None ==
+    {}`` is ``False``) and, with no count-based fallback, would orphan
+    until the hook timeout.
+
+    :param tool_input: Parked or mirrored tool input, e.g.
+        ``{"command": "ls"}``, ``{}``, or ``None``.
+    :returns: The dict unchanged, or ``{}`` when it is ``None``.
+    """
+    return tool_input if isinstance(tool_input, dict) else {}
+
+
 def _signal_terminal_resolved_harness_elicitation(
     session_id: str,
     tool_name: str,
@@ -1434,17 +1491,24 @@ def _signal_terminal_resolved_harness_elicitation(
     on reject the harness records a rejection result — so its arrival is
     a reliable "the terminal already resolved this" signal.
 
-    Correlation is by tool identity, never positional: a result only
-    resolves a parked prompt for the SAME ``tool_name`` in the same
-    session. That is what stops an unrelated auto-allowed tool's output
-    from clearing a different tool's pending prompt. Among
-    same-named parked prompts it prefers an exact ``tool_input`` match;
-    if none match exactly but exactly one same-named prompt is parked it
-    resolves that one (the hook payload and the transcript can serialize
-    identical input differently, so a single unambiguous candidate is
-    treated as the match). If several same-named prompts are parked and
-    none match by input it stays conservative and resolves none — the
-    web verdict or timeout still applies.
+    Correlation is by exact tool identity, never positional: a result
+    resolves a parked prompt only when it has the SAME ``tool_name`` AND
+    the SAME ``tool_input`` in the same session. Claude Code's
+    ``PermissionRequest`` payload carries no ``tool_use_id`` (the id is
+    minted only when the tool call is emitted, after the permission
+    check), so ``(tool_name, tool_input)`` is the only correlation signal
+    available — and both sides are unmodified JSON round-trips of the
+    same input, so exact equality holds whenever they describe the same
+    call (absent input and empty input both canonicalize to ``{}`` via
+    :func:`_canonical_tool_input`, since the park and mirror sides spell
+    "no input" differently — ``None`` vs ``{}``). A non-matching or
+    ambiguous result resolves nothing; the web verdict or timeout still
+    applies. Exact-only matching is what stops
+    one prompt's result from clearing a different prompt: approving
+    ``Bash{ls}`` in the web UI un-parks it, and mirroring its own output
+    must not then clear a still-pending ``Bash{pwd}`` sibling (an
+    unrelated auto-allowed same-named tool's output is harmless for the
+    same reason).
 
     Best-effort and idempotent: a no-op when no parked prompt matches
     (e.g. the web UI already resolved it, the tool needed no permission,
@@ -1467,12 +1531,28 @@ def _signal_terminal_resolved_harness_elicitation(
     ]
     if not candidates:
         return
+    mirrored_input = _canonical_tool_input(tool_input)
     for parked in candidates:
-        if parked.tool_input == tool_input:
+        if _canonical_tool_input(parked.tool_input) == mirrored_input:
             parked.resolved_elsewhere.set()
             return
-    if len(candidates) == 1:
-        candidates[0].resolved_elsewhere.set()
+    # No exact input match. Correlation is exact-only: resolving a
+    # same-named-but-different-input prompt here would clear the wrong
+    # card, so leave every candidate to its own result / web verdict /
+    # timeout. This branch is reached routinely and benignly — e.g. after
+    # a sibling prompt was web-approved and un-parked, its mirrored output
+    # finds only the still-pending different-input prompt — so it logs at
+    # debug, not warning. (A genuine match failing to compare equal would
+    # also land here, but is indistinguishable from the benign case inside
+    # this call; both inputs are unmodified JSON round-trips, so such drift
+    # is not expected.)
+    _logger.debug(
+        "Mirrored %s result in %s matched no parked prompt by input "
+        "(%d same-named prompt(s) pending); leaving them to web verdict/timeout.",
+        tool_name,
+        session_id,
+        len(candidates),
+    )
 
 
 # Strong refs so deferred card-clear tasks aren't GC'd mid-sleep.
@@ -1550,10 +1630,10 @@ def _client_supplied_hook_elicitation_id(
     raw = payload.get("_omnigent_elicitation_id")
     if raw is None:
         return None
-    if not isinstance(raw, str) or not _CLAUDE_HOOK_ELICITATION_ID_RE.fullmatch(raw):
+    if not isinstance(raw, str) or not _HOOK_ELICITATION_ID_RE.fullmatch(raw):
         raise OmnigentError(
             "PermissionRequest hook '_omnigent_elicitation_id' must match "
-            "'elicit_claude_' + 32 hex chars.",
+            "'elicit_<harness>_' + 32 hex chars.",
             code=ErrorCode.INVALID_INPUT,
         )
     owner = _harness_elicitation_owners.get(raw)
@@ -2234,6 +2314,15 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
+    # Native-terminal-wrapper sessions (claude-native-ui / codex-native-ui) are
+    # always terminal-first: the web UI's Chat/Terminal pill is gated on the
+    # ``omnigent.ui = "terminal"`` label. That flag is fully determined by the
+    # agent identity, so derive it here from ``agent_name`` rather than relying
+    # solely on the stored label — the pill then stays correct even if the
+    # stored value is missing or stale. Idempotent: a no-op when already present.
+    labels = labels_with_closed_status(conv.labels, conv.title)
+    if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
+        labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2241,7 +2330,7 @@ def _build_session_response(
         status=status,
         created_at=conv.created_at,
         title=title_without_closed_marker(conv.title),
-        labels=labels_with_closed_status(conv.labels, conv.title),
+        labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,
         runner_online=runner_online,
@@ -2924,8 +3013,18 @@ def _persist_native_cumulative_usage(
     current = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
-    # cumulative cost before the fields below overwrite it.
+    # cumulative + enforcement costs before the fields below overwrite them.
+    # Both are clamped MONOTONIC below (a write may only raise them): the
+    # ``external_session_usage`` event is posted with the session owner's own
+    # bearer token (the forwarder uses no privileged identity), so a client
+    # could otherwise replay it with a falsified low cost to reset the gate's
+    # cost to ~0 (disabling the budget DENY/ASK) and drive the daily rollup
+    # delta negative (clawing back already-spent budget). Monotonicity makes a
+    # downward report a no-op, so the worst a forged post can do is leave the
+    # figure unchanged. (See also the runner-token guard on cost_control.*
+    # label writes in ``cost_advisor`` — usage was the missing half.)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
+    old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
     if cin is not None:
         # The reported input total is INCLUSIVE of cached tokens (codex's
         # ``inputTokens`` counts cache reads). Split the cached portion into
@@ -2974,7 +3073,8 @@ def _persist_native_cumulative_usage(
         else None
     )
     if cost is not None:
-        current["total_cost_usd"] = float(cost)
+        # Monotonic: a reported total below the persisted one is ignored.
+        current["total_cost_usd"] = max(old_cost, float(cost))
     elif has_tokens:
         if isinstance(model_name, str) and model_name:
             from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
@@ -2987,7 +3087,10 @@ def _persist_native_cumulative_usage(
                 # cache reads at their own rate; it falls back to the input
                 # rate for cache tokens when the catalog omits a cache price
                 # (e.g. ``databricks-*`` entries today).
-                current["total_cost_usd"] = compute_llm_cost(current, pricing)
+                # Monotonic, like the explicit-cost branch: token totals are
+                # also client-SET, so a lowered token report can't drop the
+                # priced cost below the persisted figure.
+                current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
 
     # Per-model attribution (SET). Native harnesses report cumulative SESSION
     # totals, not per-model splits, so attribute the running cumulative buckets
@@ -3010,9 +3113,13 @@ def _persist_native_cumulative_usage(
     # Enforcement value (claude-native display/policy split). Stored
     # separately from the displayed ``total_cost_usd`` so the gate can read
     # the real-time figure (incl. in-flight sub-agent spend) while the badge
-    # shows the frozen statusLine total. SET semantics, like the rest.
+    # shows the frozen statusLine total. Monotonic, like total_cost_usd: this
+    # is the value the cost-budget gate actually reads, so a forged low report
+    # must never lower it. When an in-flight estimate later resolves below a
+    # prior peak the clamp keeps the peak — conservative (the gate errs toward
+    # MORE enforcement, never less), which is the safe direction for a budget.
     if policy_cost is not None:
-        current["policy_cost_usd"] = float(policy_cost)
+        current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
 
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's
@@ -3020,7 +3127,9 @@ def _persist_native_cumulative_usage(
     # ``total_cost_usd`` (= statusLine S), NOT ``policy_cost_usd`` — the
     # daily report must reflect real spend, not the real-time gate estimate.
     new_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
-    _record_daily_cost(conv, new_cost - old_cost, conversation_store)
+    # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
+    # daily rollup from ever being clawed back even if that invariant changes.
+    _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
     return _priced_cost_for_display(current)
 
 
@@ -3526,6 +3635,48 @@ def _publish_external_output_text_delta(session_id: str, body: SessionEventInput
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
 
 
+def _publish_external_output_reasoning_delta(session_id: str, body: SessionEventInput) -> None:
+    """
+    Broadcast a terminal-observed reasoning (chain-of-thought) delta.
+
+    The reasoning analogue of :func:`_publish_external_output_text_delta`:
+    terminal-backed integrations (the antigravity-native reader) observe a
+    streaming ``thinking`` block before the completed assistant item exists. This
+    publishes the standard reasoning SSE events the SPA already renders —
+    ``response.reasoning.started`` once (when ``data.started`` is true, marking a
+    new reasoning block) followed by ``response.reasoning_text.delta`` — without
+    persisting anything. Reasoning has no completed conversation item; the block
+    is finalized when the assistant message is persisted via
+    ``external_conversation_item``.
+
+    :param session_id: Session/conversation identifier.
+    :param body: ``POST /events`` body whose type is
+        :data:`_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE`.
+    :returns: None.
+    :raises OmnigentError: If ``data.delta`` is not a string, or ``data.started``
+        is provided with a non-boolean type.
+    """
+    delta = body.data.get("delta")
+    if not isinstance(delta, str):
+        raise OmnigentError(
+            "external_output_reasoning_delta requires string data.delta",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    started = body.data.get("started")
+    if started is not None and not isinstance(started, bool):
+        raise OmnigentError(
+            "external_output_reasoning_delta data.started must be a boolean",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if started:
+        session_stream.publish(
+            session_id,
+            ReasoningStartedEvent(type="response.reasoning.started").model_dump(exclude_none=True),
+        )
+    event = ReasoningTextDeltaEvent(type="response.reasoning_text.delta", delta=delta)
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
+
+
 def _publish_elicitation_resolved(session_id: str, elicitation_id: str) -> None:
     """
     Universal "approval done" signal — single publish drives both
@@ -3579,7 +3730,7 @@ async def _forward_approval_to_runner(
             json={"type": _APPROVAL_TYPE, "data": data},
             timeout=10.0,
         )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Approval forward failed for %r",
             session_id,
@@ -4489,13 +4640,20 @@ async def _persist_external_conversation_item(
     # The transcript is text-only, so without this the image is dropped
     # from durable history and disappears on every reload / navigation.
     cleared_pending_id: str | None = None
+    skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
         and item.data.role == "user"
         and not item.data.is_meta
     ):
-        drained = pending_inputs.resolve_oldest(session_id)
+        if _is_kiro_native_session(conv):
+            text = _message_text(item.data.content) or ""
+            matched = pending_inputs.resolve_matching_text(session_id, text)
+            drained = matched.matched
+            skipped_kiro_pending = matched.skipped
+        else:
+            drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -4511,6 +4669,12 @@ async def _persist_external_conversation_item(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
+    for skipped in skipped_kiro_pending:
+        await _persist_skipped_kiro_pending_input(
+            session_id,
+            skipped,
+            conversation_store,
+        )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     persisted = persisted_items[0]
@@ -4519,6 +4683,48 @@ async def _persist_external_conversation_item(
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
     return persisted.id
+
+
+def _is_kiro_native_session(conv: Conversation) -> bool:
+    """Return whether a conversation is backed by the native Kiro terminal."""
+    return conv.labels.get("omnigent.wrapper") == "kiro-native-ui"
+
+
+async def _persist_skipped_kiro_pending_input(
+    session_id: str,
+    skipped: pending_inputs.DrainedInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
+    turn_id = generate_task_id()
+    user_item = NewConversationItem(
+        type="message",
+        response_id=turn_id,
+        data=MessageData(role="user", content=skipped.content),
+        created_by=skipped.created_by,
+    )
+    error = ErrorData(
+        source="execution",
+        code="kiro_native_prompt_not_recorded",
+        message=(
+            "Kiro did not accept this web message into its structured session transcript. "
+            "The native terminal may have shown the underlying error."
+        ),
+    )
+    persisted_items = await asyncio.to_thread(
+        conversation_store.append,
+        session_id,
+        [
+            user_item,
+            NewConversationItem(type="error", response_id=turn_id, data=error),
+        ],
+    )
+    _publish_input_consumed(
+        session_id,
+        persisted_items[0],
+        cleared_pending_id=skipped.pending_id,
+    )
+    _publish_external_conversation_item(session_id, persisted_items[1])
 
 
 def _merge_pending_file_blocks(
@@ -6295,7 +6501,7 @@ async def _proxy_get_session_resources_to_runner(
         )
     except HTTPException:
         raise
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ConnectionError) as exc:
         _logger.warning(
             "session resources: runner call failed for session=%s (%s)",
             session_id,
@@ -6382,8 +6588,7 @@ def _is_native_terminal_session(conv: Conversation) -> bool:
     Return whether a session is owned by a terminal-native wrapper.
 
     :param conv: Conversation row for the target session.
-    :returns: ``True`` for wrappers whose transcript forwarder is the
-        single writer for conversation history.
+    :returns: ``True`` for wrappers backed by a native terminal harness.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     return native_coding_agent_for_wrapper_label(wrapper) is not None
@@ -7159,7 +7364,7 @@ async def _forward_session_change_to_runner(
             json=event,
             timeout=5.0,
         )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Session-change forward failed for session=%r type=%r",
             session_id,
@@ -7485,7 +7690,7 @@ async def _resolve_skill_meta_text_via_runner(
             json={"name": skill_name, "arguments": arguments},
             timeout=10.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ConnectionError) as exc:
         raise OmnigentError(
             f"Runner unreachable while resolving skill {skill_name!r}: {exc}",
             code=ErrorCode.INTERNAL_ERROR,
@@ -7652,7 +7857,7 @@ async def _dispatch_skill_slash_command_to_runner(
         )
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Forward of skill slash command failed for session=%s; "
             "items persisted, runner picks up on reconnect.",
@@ -7778,6 +7983,117 @@ async def _persist_session_event(
     item_id = persisted_items[0].id if persisted_items else turn_id
     _publish_external_conversation_item(session_id, persisted_items[0])
     return item_id
+
+
+def _extract_user_text_for_routing(body: SessionEventInput) -> str:
+    """Extract plain text from a user message event for the routing judge.
+
+    Concatenates all ``input_text`` blocks in ``body.data["content"]``,
+    returning the first 4 000 characters.  Returns ``""`` for non-message
+    events or events with no text content.
+    """
+    content = body.data.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "input_text":
+            text = block.get("text", "")
+            if isinstance(text, str):
+                parts.append(text)
+    return " ".join(parts)[:4000]
+
+
+async def _emit_server_routing_decision(
+    session_id: str,
+    conversation_store: ConversationStore,
+    model: str,
+    verdict: dict[str, Any],
+) -> None:
+    """Persist and publish a ``routing_decision`` transcript chip.
+
+    Called by the server-side routing path before the turn is forwarded
+    to the runner.  The chip shows the judge's model pick at turn start
+    — the same UX the runner-side advisor produced, but driven entirely
+    by the server.
+    """
+    import uuid
+
+    from omnigent.runtime import session_stream
+
+    tier = verdict.get("tier", "medium")
+    rationale = verdict.get("rationale", "")
+    item_data = {
+        "model": model,
+        "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
+        "applied": True,
+        "rationale": rationale if isinstance(rationale, str) else "",
+    }
+    try:
+        parsed_data = parse_item_data("routing_decision", item_data)
+    except (ValueError, TypeError):
+        _logger.warning("Server routing: failed to parse routing_decision data")
+        return
+
+    routing_item = NewConversationItem(
+        type="routing_decision",
+        response_id=f"routing_{uuid.uuid4().hex}",
+        data=parsed_data,
+    )
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, [routing_item])
+        persisted_id: str | None = persisted[0].id if persisted else None
+    except Exception:
+        _logger.exception(
+            "Server routing: routing_decision persist failed for session=%s",
+            session_id,
+        )
+        persisted_id = None
+
+    # Persist the verdict as a session label so the AgentInfo popover's
+    # "Intelligent model router" section can read it (it uses
+    # parseCostRoutingVerdict which reads the cost_control.plan label).
+    try:
+        import datetime
+
+        from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL
+
+        label_value = json.dumps(
+            {
+                "version": 3,
+                "tier": item_data["tier"],
+                "model": model,
+                "applied": True,
+                "rationale": item_data["rationale"],
+                "turn_anchor": datetime.datetime.now(tz=datetime.UTC).isoformat(),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {COST_CONTROL_PLAN_LABEL: label_value},
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "Server routing: failed to persist verdict label for session=%s",
+            session_id,
+            exc_info=True,
+        )
+
+    # Publish live event so the web UI renders the chip immediately.
+    session_stream.publish(
+        session_id,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": persisted_id,
+                "type": "routing_decision",
+                **item_data,
+            },
+        },
+    )
 
 
 async def _forward_event_to_runner(
@@ -7919,6 +8235,49 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # ── Server-side intelligent routing ──────────────────────────────
+    # When the session toggle is ON and no model has been chosen yet,
+    # call the judge LLM on the FIRST message to pick the model for
+    # the entire session.  The verdict is persisted as model_override
+    # on the conversation so subsequent turns reuse it without another
+    # judge call.
+    if (
+        effective_runner_override is None
+        and conv.cost_control_mode_override == "on"
+        and body.type == "message"
+    ):
+        from omnigent.server.smart_routing import route_turn
+
+        _harness = _resolve_harness(conv)
+        _user_text = _extract_user_text_for_routing(body)
+        if _user_text:
+            _routed_model, _verdict = await route_turn(_harness, _user_text)
+            if _routed_model is not None:
+                effective_runner_override = _routed_model
+                # Persist as the session's model_override so all
+                # subsequent turns use this model automatically.
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        session_id,
+                        model_override=_routed_model,
+                    )
+                except (OSError, ValueError):
+                    _logger.warning(
+                        "smart_routing: failed to persist model_override "
+                        "for session=%s; turn still uses routed model",
+                        session_id,
+                        exc_info=True,
+                    )
+                # Emit the routing_decision transcript chip so the UI
+                # shows which model was picked, before the turn output.
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict or {},
+                )
+    # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
@@ -7938,7 +8297,7 @@ async def _forward_event_to_runner(
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Forward to runner failed for session=%s; "
             "event persisted, runner picks up on reconnect.",
@@ -7988,13 +8347,13 @@ async def _dispatch_session_event_to_runner(
     Callers stay harness-agnostic — the claude-native message bypass
     is encapsulated here. Two dispatch outcomes:
 
-    * **claude-native + ``type == "message"``**: web-chat user
+    * **transcript-forwarded native + ``type == "message"``**: web-chat user
       messages on these sessions must NOT be persisted by the AP
       server. The Omnigent would otherwise persist an AP-side copy AND
       let the transcript forwarder mirror the same message back
       (with its own store-assigned item id), so every web-typed
       prompt would land as two items in the chat panel. We forward
-      to the bound runner so the claude-native harness types the
+      to the bound runner so the native harness types the
       message into tmux; the transcript forwarder becomes the
       single writer for the conversation history. Returns a result
       with ``item_id=None`` (no AP-side persisted item) and a
@@ -8089,6 +8448,38 @@ async def _dispatch_session_event_to_runner(
             if isinstance(content, list) and content
             else None
         )
+        # ── Server-side routing for native terminal sessions ────────
+        # Same logic as the SDK path in _forward_event_to_runner: if
+        # the toggle is on and no model_override is set, call the
+        # judge and persist the chosen model on the conversation row.
+        # The native CLI reads model_override from the session.
+        if conv.model_override is None and conv.cost_control_mode_override == "on":
+            from omnigent.server.smart_routing import route_turn
+
+            _harness = _resolve_harness(conv)
+            _user_text = _extract_user_text_for_routing(body)
+            if _user_text:
+                _routed_model, _verdict = await route_turn(_harness, _user_text)
+                if _routed_model is not None:
+                    try:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            model_override=_routed_model,
+                        )
+                    except (OSError, ValueError):
+                        _logger.warning(
+                            "smart_routing: persist failed for native session=%s",
+                            session_id,
+                            exc_info=True,
+                        )
+                    await _emit_server_routing_decision(
+                        session_id,
+                        conversation_store,
+                        _routed_model,
+                        _verdict or {},
+                    )
+        # ────────────────────────────────────────────────────────────
         forwarded = False
         try:
             await _forward_native_terminal_message(
@@ -8255,6 +8646,51 @@ def _resource_event_item_from_sse(
             resource_type=resource_type,
             resource=resource,
         ),
+    )
+
+
+def _routing_decision_item_from_sse(
+    event: dict[str, Any],
+) -> NewConversationItem | None:
+    """
+    Build a ``routing_decision`` conversation item from a runner SSE event.
+
+    The runner's cost advisor emits a ``response.output_item.done`` with a
+    ``routing_decision`` item at the START of an advised turn (the
+    intelligent model router's pick). This produces the durable,
+    display-only transcript item so the pick survives reload at the right
+    position (BEFORE the turn's assistant output); the relay also
+    re-publishes a live event carrying the persisted item id so the live
+    chip and a turn-start snapshot refetch dedup by the same id (no
+    double render).
+
+    Returns ``None`` for every other event, and for a malformed routing
+    item (empty model / unknown tier) so a bad frame can't poison the
+    relay.
+
+    :param event: Parsed SSE event dict from the runner stream.
+    :returns: A ``routing_decision`` :class:`NewConversationItem`, or
+        ``None``.
+    """
+    if event.get("type") != "response.output_item.done":
+        return None
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "routing_decision":
+        return None
+    try:
+        data = parse_item_data("routing_decision", item)
+    except (ValueError, TypeError):
+        _logger.warning("Failed to parse routing_decision item from SSE")
+        return None
+    # No turn response_id exists yet (emitted before response.in_progress),
+    # so stamp a fresh routing id — the chip renders as its own standalone
+    # line at turn start.
+    import uuid
+
+    return NewConversationItem(
+        type="routing_decision",
+        response_id=f"routing_{uuid.uuid4().hex}",
+        data=data,
     )
 
 
@@ -8817,6 +9253,43 @@ async def _relay_runner_stream(
                         ):
                             _publish_terminal_pending(session_id, False)
 
+                    # Intelligent-model-router decision emitted by the runner's
+                    # cost advisor at turn start. Persist as a display-only
+                    # transcript item (arrival order = BEFORE the assistant
+                    # output), then re-publish the live event carrying the
+                    # store-assigned id so the live chip and a turn-start
+                    # snapshot refetch dedup by the same id. Handled
+                    # exclusively here (persist + publish + continue) so the
+                    # raw, id-less runner event is not also forwarded below.
+                    routing_item = _routing_decision_item_from_sse(event)
+                    if routing_item is not None:
+                        # Persist failure must NOT suppress the live chip
+                        # (the owner's hard requirement: the pick shows the
+                        # moment the turn starts). On a store error, log and
+                        # still publish the live event — id-less, so a later
+                        # snapshot can't dedup it, but a missing reload chip
+                        # beats no chip at all.
+                        try:
+                            persisted = await asyncio.to_thread(
+                                conversation_store.append, session_id, [routing_item]
+                            )
+                            _persisted_id: str | None = persisted[0].id if persisted else None
+                        except Exception:
+                            _logger.exception(
+                                "Relay: routing_decision persist failed for session=%s; "
+                                "publishing the live chip without a durable id",
+                                session_id,
+                            )
+                            _persisted_id = None
+                        session_stream.publish(
+                            session_id,
+                            {
+                                **event,
+                                "item": {**event["item"], "id": _persisted_id},
+                            },
+                        )
+                        continue
+
                     # Accumulate LLM token usage from the harness
                     # response so policy callables can read
                     # event["context"]["usage"]["total_cost_usd"].
@@ -8924,9 +9397,19 @@ async def _relay_runner_stream(
         # close; treat the same as HTTPError so the task exits
         # gracefully instead of leaving an unretrieved exception.
         _logger.warning(
-            "Relay: ended for session=%s",
+            "Relay: runner transport lost for session=%s",
             session_id,
             exc_info=True,
+        )
+        # Publish a failed status so the client's SSE stream sees a
+        # clean error event instead of silent truncation (#1114).
+        _publish_status(
+            session_id,
+            "failed",
+            ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            ),
         )
     except asyncio.CancelledError:
         raise
@@ -11487,7 +11970,7 @@ async def _notify_runner_of_bundled_child(
             },
             timeout=10.0,
         )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ConnectionError):
         _logger.warning(
             "Failed to notify runner about bundled session %s",
             session_id,
@@ -11890,6 +12373,11 @@ async def _handle_mcp_tools_list(
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
+        # Fall back to the in-process runner client (local single-user mode).
+        from omnigent.runtime import get_runner_client
+
+        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
+    if runner_client is None:
         return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
     _logger.debug("MCP tools/list: delegating to runner execute for session=%r", session_id)
     try:
@@ -12203,6 +12691,10 @@ async def _handle_mcp_tools_call(
     # tunnel the runner already opened to the Omnigent server at startup.
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
+        from omnigent.runtime import get_runner_client
+
+        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
+    if runner_client is None:
         return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
     try:
         from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
@@ -12351,6 +12843,44 @@ async def _handle_mcp_tools_call(
         rpc_id,
         {"content": [{"type": "text", "text": output}]},
     )
+
+
+# Read uploads in 1 MiB chunks so an oversized body is aborted ~1 MiB past
+# the cap instead of being buffered whole (the previous unconditional
+# ``await file.read()`` was an OOM risk for very large uploads).
+_UPLOAD_READ_CHUNK_BYTES: int = 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
+    """
+    Read an uploaded file into memory, aborting if it exceeds *limit_bytes*.
+
+    Reads in :data:`_UPLOAD_READ_CHUNK_BYTES` chunks and raises HTTP 413 as
+    soon as the cap is crossed, so an oversized upload never buffers more
+    than one chunk past the limit.
+
+    :param file: The multipart upload.
+    :param limit_bytes: Maximum allowed size in bytes.
+    :returns: The full file content.
+    :raises HTTPException: 413 when the upload exceeds *limit_bytes*.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Attachment exceeds the {limit_bytes // (1024 * 1024)} MB "
+                    "limit for this file type."
+                ),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def create_sessions_router(
@@ -12553,7 +13083,7 @@ def create_sessions_router(
                     },
                     timeout=10.0,
                 )
-            except httpx.HTTPError:
+            except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
                     resp.id,
@@ -12815,8 +13345,11 @@ def create_sessions_router(
 
     @router.get(
         "/sessions/{session_id}",
-        # See create_session for the response_model=None rationale.
+        # See create_session for the response_model=None rationale. We keep
+        # response_model=None (no response re-validation/serialization) but
+        # still advertise the body schema for docs/SDK tooling via responses=.
         response_model=None,
+        responses={200: {"model": SessionResponse}},
     )
     async def get_session(
         request: Request,
@@ -12925,6 +13458,7 @@ def create_sessions_router(
     @router.get(
         "/sessions",
         response_model=None,
+        responses={200: {"model": SessionList}},
     )
     async def list_sessions(
         request: Request,
@@ -13452,6 +13986,7 @@ def create_sessions_router(
     @router.patch(
         "/sessions/{session_id}",
         response_model=None,
+        responses={200: {"model": SessionResponse}},
     )
     async def update_session(
         request: Request,
@@ -13825,10 +14360,11 @@ def create_sessions_router(
     @router.post(
         "/sessions/{source_id}/fork",
         status_code=201,
-        # response_model=None: handler returns SessionResponse
-        # but we suppress the OpenAPI schema injection to match
-        # the convention of sibling routes.
+        # response_model=None keeps FastAPI from re-validating/serializing
+        # the handler's SessionResponse; responses= still advertises the
+        # body schema to docs/SDK tooling.
         response_model=None,
+        responses={201: {"model": SessionResponse}},
     )
     async def fork_session(
         request: Request,
@@ -13914,16 +14450,14 @@ def create_sessions_router(
                 )
             base_agent = target_agent
 
-        # Clone the chosen agent's bundle into a fresh session-scoped row so
-        # the fork can be reconfigured without mutating the original.
+        # Clone params for the fork's session-scoped agent. Created inside
+        # fork_conversation's transaction (not agent_store.create): a
+        # pre-created row would survive a fork failure as an orphaned
+        # session_id=NULL built-in polluting the picker. Session-scoped rows
+        # are exempt from the unique built-in-name index, so the clone reuses
+        # the source's name verbatim — no "(fork …)" suffix needed.
         cloned_agent_id = generate_agent_id()
-        await asyncio.to_thread(
-            agent_store.create,
-            agent_id=cloned_agent_id,
-            name=f"{base_agent.name} (fork {cloned_agent_id[:10]})",
-            bundle_location=base_agent.bundle_location,
-            description=base_agent.description,
-        )
+        cloned_agent_name = base_agent.name
 
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
@@ -13974,6 +14508,9 @@ def create_sessions_router(
                 source_id,
                 title=body.title,
                 agent_id=cloned_agent_id,
+                cloned_agent_name=cloned_agent_name,
+                cloned_agent_bundle_location=base_agent.bundle_location,
+                cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
@@ -14016,9 +14553,11 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/switch-agent",
-        # response_model=None: handler returns SessionResponse but we
-        # suppress the OpenAPI schema injection to match sibling routes.
+        # response_model=None keeps FastAPI from re-validating/serializing
+        # the handler's SessionResponse; responses= still advertises the
+        # body schema to docs/SDK tooling.
         response_model=None,
+        responses={200: {"model": SessionResponse}},
     )
     async def switch_session_agent(
         request: Request,
@@ -14227,6 +14766,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/hooks/permission-request",
+        # Internal harness callback webhook — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,
         # CSRF hardening: body is parsed via request.json(); require a JSON
         # Content-Type so a cross-site text/plain request can't reach it.
@@ -14792,6 +15333,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/hooks/codex-elicitation-request",
+        # Internal harness callback webhook — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,
         # CSRF hardening: body is parsed via request.json(); require a JSON
         # Content-Type so a cross-site text/plain request can't reach it.
@@ -14859,11 +15402,312 @@ def create_sessions_router(
             media_type="application/json",
         )
 
+    # ── POST /sessions/{session_id}/hooks/antigravity-elicitation-request ──
+
+    @router.post(
+        "/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        # Internal harness callback webhook — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def antigravity_elicitation_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Antigravity (agy) elicitation request endpoint.
+
+        Receives ``{"elicitation_id": <str>, "params": <ElicitationRequestParams>}``
+        from the interaction bridge (Task 8), which POSTs here when it
+        surfaces an agy WAITING interaction for the web UI. Parks the call
+        on the shared harness elicitation registry, emits the standard
+        ``response.elicitation_request`` SSE event, waits for the session
+        ``approval`` verdict, then returns the raw
+        :class:`~omnigent.server.schemas.ElicitationResult` so the bridge
+        can forward it to agy via ``HandleCascadeUserInteraction``.
+
+        This is intentionally simpler than the Codex hook: the bridge
+        (not the endpoint) builds the agy interaction payload via
+        ``to_interaction_payload``, so this endpoint only passes back
+        the verdict as-is.  The body shape is minimal and symmetric:
+        ``elicitation_id`` from the bridge's deterministic id function
+        (``agy_elicitation_id``), ``params`` as an
+        :class:`~omnigent.server.schemas.ElicitationRequestParams` dict.
+
+        :param request: FastAPI request carrying the agy elicitation body.
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: ``ElicitationResult`` JSON on user verdict; ``200`` with
+            empty body on timeout/disconnect (bridge interprets as ``None``).
+        :raises OmnigentError: 404 if the session does not exist, 400 if
+            the request body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in antigravity elicitation hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Antigravity elicitation hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Antigravity elicitation hook body must include a non-empty"
+                " 'elicitation_id' string.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        raw_params = payload.get("params")
+        if not isinstance(raw_params, dict):
+            raise OmnigentError(
+                "Antigravity elicitation hook body must include a 'params' object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            params = ElicitationRequestParams.model_validate(raw_params)
+        except Exception as exc:
+            raise OmnigentError(
+                f"Invalid 'params' in antigravity elicitation hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=result.model_dump_json(),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/cursor-permission-request ─
+
+    @router.post(
+        "/sessions/{session_id}/hooks/cursor-permission-request",
+        # Internal harness callback webhook — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def cursor_permission_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Cursor-native tool-approval hook (TUI → web elicitation).
+
+        Receives a tool-approval prompt detected on the ``cursor-agent`` TUI
+        pane by the runner-side mirror
+        (:mod:`omnigent.cursor_native_permissions`), publishes the standard
+        ``response.elicitation_request`` event for the web UI, then parks for
+        the session ``approval`` verdict — the same registry / publish /
+        cleanup path as the Codex- and Claude-native hooks, so pending badges
+        and disconnect handling stay consistent across native harnesses. An
+        empty ``200`` (no web verdict — the prompt was answered in the TUI, or
+        the wait timed out) leaves cursor's native prompt authoritative.
+
+        :param request: FastAPI request carrying the detected prompt
+            (``elicitation_id`` plus the ``message`` / ``content_preview`` /
+            ``operation_type`` to render).
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: An ``ElicitationResult`` (``{"action": …}``) on a web
+            verdict, or ``200`` with empty body on TUI-resolution / timeout /
+            disconnect.
+        :raises OmnigentError: 404 if the session does not exist, 400 if the
+            body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in cursor permission hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Cursor permission hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Cursor permission hook body must include 'elicitation_id'.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = "Cursor wants approval to run a tool"
+        content_preview = payload.get("content_preview")
+        if not isinstance(content_preview, str):
+            content_preview = None
+        operation_type = payload.get("operation_type")
+        if not isinstance(operation_type, str) or not operation_type:
+            operation_type = "tool"
+        # Structured AskQuestion payload (cursor's multiple-choice tool): when
+        # present, stamp it as the ``ask_user_question`` extra so the web UI
+        # renders the interactive form from it directly. ``content_preview`` is
+        # hard-capped at 1024 chars, which truncates a multi-question payload and
+        # breaks the preview-parse fallback — the structured field has no such
+        # cap and is the authoritative source the UI consumes when present.
+        extras: dict[str, Any] = {}
+        ask_user_question = payload.get("ask_user_question")
+        if isinstance(ask_user_question, dict) and isinstance(
+            ask_user_question.get("questions"), list
+        ):
+            extras["ask_user_question"] = ask_user_question
+        params = ElicitationRequestParams(
+            mode="form",
+            message=message,
+            requestedSchema=None,
+            url=None,
+            phase="pre_tool_use",
+            policy_name="cursor_native_permission",
+            content_preview=content_preview,
+            **extras,
+        )
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            tool_name=f"Cursor({operation_type})",
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=json.dumps(result.model_dump(exclude_none=True)),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/native-permission-request ─
+
+    @router.post(
+        "/sessions/{session_id}/hooks/native-permission-request",
+        # Internal harness callback webhook — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def native_permission_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Generic native-TUI tool-approval hook (TUI → web elicitation).
+
+        The vendor-agnostic counterpart of
+        :func:`cursor_permission_request_hook`, used by the hermes- and
+        goose-native approval mirrors. The runner-side mirror detects the
+        vendor's in-terminal approval prompt, POSTs it here, and the server
+        publishes ``response.elicitation_request`` and parks for the web verdict
+        — the same registry/publish/cleanup path as the cursor/codex/claude
+        hooks. An empty ``200`` (TUI answered, or timeout) leaves the vendor's
+        native prompt authoritative.
+
+        Unlike the cursor hook, the card label / policy name come from the
+        payload (``agent`` / ``policy_name``) so a Hermes or Goose approval is
+        labelled as such, not "Cursor".
+
+        :param request: FastAPI request carrying the detected prompt
+            (``elicitation_id``, ``message``, ``content_preview``,
+            ``operation_type``, optional ``agent`` / ``policy_name``).
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: An ``ElicitationResult`` (``{"action": …}``) on a web verdict,
+            or ``200`` with empty body on TUI-resolution / timeout / disconnect.
+        :raises OmnigentError: 404 if the session does not exist, 400 if the
+            body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in native permission hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Native permission hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Native permission hook body must include 'elicitation_id'.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        agent = payload.get("agent")
+        if not isinstance(agent, str) or not agent:
+            agent = "Agent"
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = f"{agent} wants approval to run a tool"
+        content_preview = payload.get("content_preview")
+        if not isinstance(content_preview, str):
+            content_preview = None
+        operation_type = payload.get("operation_type")
+        if not isinstance(operation_type, str) or not operation_type:
+            operation_type = "tool"
+        policy_name = payload.get("policy_name")
+        if not isinstance(policy_name, str) or not policy_name:
+            policy_name = "native_permission"
+        params = ElicitationRequestParams(
+            mode="form",
+            message=message,
+            requestedSchema=None,
+            url=None,
+            phase="pre_tool_use",
+            policy_name=policy_name,
+            content_preview=content_preview,
+        )
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            tool_name=f"{agent}({operation_type})",
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=json.dumps(result.model_dump(exclude_none=True)),
+            media_type="application/json",
+        )
+
     # ── GET /sessions/{session_id}/items ─────────────────────────
 
     @router.get(
         "/sessions/{session_id}/items",
         response_model=None,
+        responses={200: {"model": PaginatedList}},
     )
     async def list_session_items(
         request: Request,
@@ -14924,6 +15768,7 @@ def create_sessions_router(
     @router.get(
         "/sessions/{session_id}/child_sessions",
         response_model=None,
+        responses={200: {"model": ChildSessionList}},
     )
     async def list_child_sessions(
         request: Request,
@@ -15162,7 +16007,7 @@ def create_sessions_router(
             )
         try:
             resp = await runner_client.get(path, params=params, timeout=10.0)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -15209,7 +16054,7 @@ def create_sessions_router(
                 json=body,
                 timeout=10.0,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -15237,7 +16082,7 @@ def create_sessions_router(
             )
         try:
             resp = await runner_client.delete(path, timeout=10.0)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -15271,7 +16116,7 @@ def create_sessions_router(
                 json=body,
                 timeout=10.0,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -15305,7 +16150,7 @@ def create_sessions_router(
                 json=body,
                 timeout=10.0,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -15493,6 +16338,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
+        # Internal terminal transfer — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,
         # CSRF hardening: body is parsed via request.json(); require a JSON
         # Content-Type so a cross-site text/plain request can't reach it.
@@ -15700,14 +16547,44 @@ def create_sessions_router(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        content = await file.read()
         from omnigent.runtime.content_resolver import (
+            MAX_ATTACHMENT_UPLOAD_BYTES,
             _resolve_content_type,
+            attachment_text_type_for_extension,
+            attachment_upload_limit,
         )
 
+        # Resolve the type from the declared MIME + filename BEFORE reading
+        # the body, so an unsupported or oversized upload is rejected without
+        # buffering it. Attachments are inlined into the model context as
+        # base64 (see content_resolver.resolve_content_references); only
+        # images, PDF, and text/code files are usable — others (pptx, docx,
+        # zip, …) would be garbled or blow the request size, so reject them.
         content_type = _resolve_content_type(
             file.content_type,
             file.filename,
+        )
+        type_limit = attachment_upload_limit(content_type)
+        if type_limit is None:
+            # The browser/OS can mislabel a text/code file as binary (e.g. a
+            # .csv reported as application/vnd.ms-excel on Windows). Fall back
+            # to the extension — matching the web client's allowlist — and
+            # normalize the type so the resolver inlines it as text.
+            ext_type = attachment_text_type_for_extension(file.filename)
+            if ext_type is not None:
+                content_type = ext_type
+                type_limit = attachment_upload_limit(content_type)
+        if type_limit is None:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"Unsupported attachment type '{content_type}'. Only images, "
+                    "PDF, and text/code files can be attached."
+                ),
+            )
+        content = await _read_upload_capped(
+            file,
+            min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES),
         )
         stored = file_store.create(
             session_id=session_id,
@@ -16029,6 +16906,8 @@ def create_sessions_router(
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/diff/{relative_path:path}",
+        # Internal (UI diff view) — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,
     )
     async def read_environment_file_diff(
@@ -16262,6 +17141,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        # Internal elicitation flow — hidden from the public API reference.
+        include_in_schema=False,
         status_code=202,
         # response_model=None: the body is a small acknowledgement
         # dict, not a domain model.
@@ -16330,6 +17211,8 @@ def create_sessions_router(
 
     @router.get(
         "/sessions/{session_id}/elicitations/{elicitation_id}",
+        # Internal elicitation flow — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,
     )
     async def get_elicitation(
@@ -16386,6 +17269,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/events",
+        # Internal event ingestion — hidden from the public API reference.
+        include_in_schema=False,
         status_code=202,
         # response_model=None: the body is a small acknowledgement
         # dict, not a domain model.
@@ -16416,6 +17301,11 @@ def create_sessions_router(
           ``response.output_text.delta`` event observed outside the
           Omnigent task runtime, without persisting an item or starting /
           steering a task.
+        - ``"external_output_reasoning_delta"`` publishes a transient
+          ``response.reasoning_text.delta`` event (preceded by one
+          ``response.reasoning.started`` when ``data.started`` is true)
+          observed outside the Omnigent task runtime, without persisting an
+          item or starting / steering a task.
         - ``"external_session_interrupted"`` publishes a
           ``session.interrupted`` event observed outside the Omnigent task
           runtime, without persisting an item or starting / steering a
@@ -16503,6 +17393,7 @@ def create_sessions_router(
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+            _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
             _EXTERNAL_SESSION_INTERRUPTED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
@@ -16870,6 +17761,9 @@ def create_sessions_router(
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
             _publish_external_output_text_delta(session_id, body)
             return {"queued": False}
+        if body.type == _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE:
+            _publish_external_output_reasoning_delta(session_id, body)
+            return {"queued": False}
         if body.type == _EXTERNAL_SESSION_INTERRUPTED_TYPE:
             response_id = body.data.get("response_id")
             if response_id is not None and not isinstance(response_id, str):
@@ -17036,7 +17930,7 @@ def create_sessions_router(
                     },
                     timeout=10.0,
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, ConnectionError) as exc:
                 # Fail loud (503), not best-effort: unlike the advisory
                 # interrupt-forward, a dropped tool_result leaves the parked
                 # turn hanging until it times out. Surfacing the failure lets
@@ -17520,6 +18414,7 @@ def create_sessions_router(
     @router.delete(
         "/sessions/{session_id}",
         response_model=None,
+        responses={200: {"model": ConversationDeleted}},
     )
     async def delete_session(
         request: Request,
@@ -17589,7 +18484,7 @@ def create_sessions_router(
                     f"/v1/sessions/{session_id}/resources",
                     timeout=10.0,
                 )
-            except httpx.HTTPError:
+            except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Runner cleanup failed for %s, falling back",
                     session_id,
@@ -17674,6 +18569,7 @@ def create_sessions_router(
     @router.put(
         "/sessions/{session_id}/permissions",
         response_model=None,
+        responses={200: {"model": PermissionObject}},
     )
     async def grant_permission(
         request: Request,
@@ -17807,6 +18703,7 @@ def create_sessions_router(
     @router.get(
         "/sessions/{session_id}/permissions",
         response_model=None,
+        responses={200: {"model": list[PermissionObject]}},
     )
     async def list_permissions(
         request: Request,
@@ -17951,6 +18848,9 @@ def create_sessions_router(
             updated_at=agent.updated_at,
             harness=harness,
             mcp_servers=mcp_servers,
+            mcp_servers_editable=(
+                agent.session_id is not None and not (harness or "").endswith("-native")
+            ),
             policies=policies,
             skills=skills,
             terminals=terminals,
@@ -18183,6 +19083,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/mcp",
+        # Internal MCP proxy — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,  # Returns a raw Response with application/json
         # CSRF hardening: the MCP Streamable HTTP contract already mandates
         # an application/json request body; enforce it so a cross-site
@@ -18348,7 +19250,7 @@ async def _load_runner_skills(
             f"/v1/sessions/{session_id}/skills",
             timeout=5.0,
         )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ConnectionError):
         _logger.debug("Runner skills query failed for %s", session_id)
         return
     if resp.status_code != 200:
@@ -18385,28 +19287,55 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     return options
 
 
+# Native harnesses whose model picker is populated from a *live*, runner-owned
+# model-options endpoint, keyed by wrapper label -> the runner route segment.
+# Codex queries its live app-server ``model/list`` (account/session-scoped, so
+# it must come from the bound runner). Cursor is deliberately NOT here: its
+# catalog is a curated *static* base list served directly (see
+# ``_fetch_model_options``), which keeps it off the runner-backed cache that
+# ``refresh_state`` invalidates — otherwise an effort/model change would blank
+# the cursor picker mid-session.
+_MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+}
+
+
 async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
 ) -> list[dict[str, Any]]:
     """
-    Fetch cached Codex model options for a codex-native session.
+    Resolve the Web UI model-picker options for a native session.
 
-    The bound runner owns this query because only it can reach the live
-    Codex app-server socket. Like skills, this stays off the snapshot hot
-    path: the first snapshot kicks a background fetch and returns ``[]``;
-    subsequent snapshots serve the cache.
+    Two shapes:
+
+    * **cursor-native** — a curated *static* base catalog
+      (:func:`omnigent.cursor_native.cursor_base_model_options`), returned
+      directly on every snapshot. It deliberately bypasses the runner-backed
+      cache below: the catalog never changes per session, and routing it
+      through that cache would let a ``refresh_state`` snapshot (which pops the
+      cache) blank the picker on an effort/model change.
+    * **codex-native** — a *live*, account-scoped catalog only the bound runner
+      can read (its app-server ``model/list``). Like skills, this stays off the
+      snapshot hot path: the first snapshot kicks a background fetch and returns
+      ``[]``; subsequent snapshots serve the cache.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
-    :returns: Cached Codex options, or ``[]`` when not codex-native or not
-        yet available.
+    :returns: Model options, or ``[]`` when the session has no model picker or
+        the (codex) options are not yet available.
     """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper == _CURSOR_NATIVE_WRAPPER_LABEL_VALUE:
+        from omnigent.cursor_native import cursor_base_model_options
+
+        return cursor_base_model_options()
+    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
+    if endpoint is None:
         return []
     if runner_client is None:
         return []
@@ -18414,7 +19343,8 @@ async def _fetch_model_options(
     if cached is not None:
         return cached
     if session_id not in _model_options_inflight:
-        task = asyncio.create_task(_load_model_options(runner_client, session_id))
+        path = f"/v1/sessions/{session_id}/{endpoint}"
+        task = asyncio.create_task(_load_model_options(runner_client, session_id, path))
         _model_options_inflight[session_id] = task
         task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
     return []
@@ -18423,24 +19353,26 @@ async def _fetch_model_options(
 async def _load_model_options(
     runner_client: httpx.AsyncClient,
     session_id: str,
+    path: str,
 ) -> None:
     """
-    Background single-flight fetch of a session's Codex model catalog.
+    Background single-flight fetch of a session's native model catalog.
 
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param path: Runner route to query, e.g.
+        ``"/v1/sessions/conv_abc/cursor-model-options"``.
     """
-    path = f"/v1/sessions/{session_id}/codex-model-options"
     for attempt in range(len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
         try:
             resp = await runner_client.get(path, timeout=5.0)
-        except httpx.HTTPError:
-            _logger.debug("Runner Codex model-options query failed for %s", session_id)
+        except (httpx.HTTPError, ConnectionError):
+            _logger.debug("Runner model-options query failed for %s", session_id)
             return
         if resp.status_code != 200:
-            # 503 means Codex's app-server bridge is still booting. Keep the
-            # background single-flight alive so the web picker fills without a
-            # second manual refresh.
+            # 503 means the native backend (Codex app-server bridge / cursor
+            # login) is still booting. Keep the background single-flight alive
+            # so the web picker fills without a second manual refresh.
             if resp.status_code == 503 and attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
                 await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
@@ -18448,7 +19380,7 @@ async def _load_model_options(
         try:
             options = _model_options_from_wire(resp.json().get("models", []))
         except (ValueError, KeyError, TypeError, ValidationError):
-            _logger.debug("Runner Codex model-options payload malformed for %s", session_id)
+            _logger.debug("Runner model-options payload malformed for %s", session_id)
             return
         if not options:
             # Older runners returned 200 + [] for the same not-ready window.
@@ -18586,7 +19518,7 @@ async def _get_session_snapshot(
                     raw = resp.json().get("status", "idle")
                     _session_status_cache[session_id] = raw
                     status = _session_status_from_cache(session_id)
-            except httpx.HTTPError:
+            except (httpx.HTTPError, ConnectionError):
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
@@ -18638,28 +19570,33 @@ async def _get_session_snapshot(
                     if spec.name:
                         agent_name = spec.name
                     llm_model = spec.executor.model
-                    # Size the context ring against whatever the next turn
-                    # will actually run. spec.executor.context_window only
-                    # applies to spec.model, so it's bypassed when an
-                    # override is active.
-                    effective_model = (
-                        conv.model_override if conv.model_override is not None else llm_model
+                    from omnigent.llms.context_window import (
+                        resolve_effective_context_window,
                     )
-                    spec_cw = spec.executor.context_window
-                    if spec_cw is not None and conv.model_override is None:
-                        context_window = spec_cw
-                    elif effective_model is not None:
-                        from omnigent.llms.context_window import get_model_context_window
 
-                        # Offload to a worker thread: on a cache-cold
-                        # provider catalog this does a blocking HTTP fetch
-                        # (and litellm registry lookups are CPU-bound), so
-                        # running it inline would stall the single-worker
-                        # event loop and serialize every concurrent request
-                        # behind this snapshot.
-                        context_window = await asyncio.to_thread(
-                            get_model_context_window, effective_model
-                        )
+                    # Size the context ring against whatever the next turn will
+                    # actually run, using the SAME resolver the runner uses to
+                    # budget compaction. That makes the UI ring and the runner's
+                    # compaction trigger a single source of truth — computed by
+                    # one function — so they can't drift even though they run in
+                    # different processes at different times. (They previously
+                    # each inlined this rule and silently fell out of step; see
+                    # PR #769 review. Sharing the function removes the manual
+                    # sync.) spec.executor.context_window describes only the spec
+                    # model, so an active override bypasses it — the resolver
+                    # makes that decision from the spec model + override.
+                    #
+                    # Offload to a worker thread: an active override (or an
+                    # undeclared window) can trigger a cache-cold provider
+                    # catalog fetch (blocking HTTP / CPU-bound litellm) inside
+                    # the resolver, which would otherwise stall the single-worker
+                    # event loop and serialize every concurrent snapshot.
+                    context_window = await asyncio.to_thread(
+                        resolve_effective_context_window,
+                        spec.executor.context_window,
+                        llm_model,
+                        model_override=conv.model_override,
+                    )
         except Exception:  # noqa: BLE001 — best-effort; missing agent must not break session fetch
             pass
     # Skills are runner-owned: the bound runner discovers them against its
