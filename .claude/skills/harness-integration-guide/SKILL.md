@@ -40,14 +40,7 @@ the vendor's tool-calling interface.
 | **Compaction** | Long conversations are compacted; harness surfaces `CompactionComplete` events |
 | **Reasoning** | Model reasoning/thinking tokens are forwarded |
 | **Images** | Image content (screenshots, diagrams) is forwarded — full binary, path reference, or text-flattened |
-
-### Transport types
-
-| Type | Description |
-|---|---|
-| **SDK in-process** | Harness runs inside the Omnigent Python process via a vendor SDK |
-| **CLI subprocess** | Harness spawns a vendor CLI binary and communicates via stdout/stdin (JSONL, stream-json, or shell hooks) |
-| **ACP subprocess** | Harness uses the Agent Communication Protocol over a subprocess |
+| **Cost tracking** | Harness reports token usage and cost data back to Omnigent for each turn |
 
 ### MCP connectivity
 
@@ -108,6 +101,7 @@ All capabilities are **required** for a complete harness integration:
 - [ ] Compaction is surfaced (`CompactionComplete` events)
 - [ ] Reasoning tokens are forwarded
 - [ ] Images are forwarded (full binary preferred; path or text-flattened acceptable)
+- [ ] Cost tracking reports token usage and cost per turn
 - [ ] Unit tests cover tool bridging, auth, model routing
 - [ ] E2E skill exists for manual smoke-testing against a live server
 - [ ] Mock LLM tests cover the happy path without real API calls
@@ -137,6 +131,7 @@ Omnigent. They relay the vendor's conversation into the Omnigent session.
 | **Compaction** | Vendor-internal compaction status |
 | **Reasoning** | Model reasoning/thinking tokens are forwarded |
 | **Images** | Image content is forwarded — path reference, full binary, or text-flattened |
+| **Cost tracking** | Native harness reports token usage and cost data back to Omnigent for each turn |
 
 ### Checklist for a new native harness
 
@@ -156,6 +151,7 @@ All capabilities are **required** for a complete native harness integration:
 - [ ] Compaction status is surfaced
 - [ ] Reasoning tokens are forwarded
 - [ ] Images are forwarded (path preferred; binary or text-flattened acceptable)
+- [ ] Cost tracking reports token usage and cost per turn
 - [ ] Unit tests cover forwarder, auth, transport
 - [ ] E2E skill exists for manual smoke-testing against a live server
 - [ ] Mock LLM tests cover the happy path without real API calls
