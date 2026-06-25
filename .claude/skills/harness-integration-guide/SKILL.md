@@ -31,7 +31,7 @@ the vendor's tool-calling interface.
 | **Model override** | User can select a model via `--model` / config; some harnesses are vendor-locked (e.g. Claude-only, GPT-only, Gemini-only) |
 | **Auth** | How credentials are obtained — API key, gateway token, vendor CLI login, OAuth, etc. |
 | **Streaming** | Harness forwards token-level or delta-level streaming to the Omnigent forwarder |
-| **Omnigent policies** | Harness enforces Omnigent-side tool policies — policy DENY, pre-gated allow-lists, pre-tool hooks |
+| **Omnigent policies** | Harness enforces Omnigent-side tool policies — must support ALLOW, ASK, and DENY verdicts for both tool calls and tool results |
 | **Native elicitation (web)** | Harness surfaces tool-approval requests to the web UI — `canUseTool ASK`, `request_permission`, 2-stage cards |
 | **Interrupt** | User can cancel a running turn mid-stream |
 | **Live queue (concurrent)** | Multiple turns can be queued and processed concurrently |
@@ -54,13 +54,15 @@ the vendor's tool-calling interface.
 - **In-proc SDK MCP server** — the harness runs an MCP server in-process and the SDK connects to it directly (e.g. claude-sdk).
 - **Non-MCP bridges** — many harnesses use vendor-specific tool bridging: `dynamicTools` RPC (codex), SDK `custom_tools` (cursor), SDK `FunctionTool` (openai-agents), TCP socket (pi), shell hooks (hermes), SDK in-proc tools (antigravity), SDK tool handlers (copilot).
 
-### Omnigent policy strategies
+### Omnigent policies
 
-| Strategy | How it works |
-|---|---|
-| Policy DENY | Omnigent policy engine denies disallowed calls |
-| Pre-gated | Tools are pre-approved via allow-lists; bypass gating |
-| Pre-tool hook | Shell hook runs before each tool call; can DENY |
+The harness must support the Omnigent policy engine's three verdicts at two
+checkpoints:
+
+| Checkpoint | ALLOW | ASK | DENY |
+|---|---|---|---|
+| **Tool call** (before execution) | Proceed silently | Surface approval request to user (via elicitation) | Block the call and return a policy-denied error to the model |
+| **Tool result** (after execution) | Return result to model | Surface result for user review before returning | Suppress the result and return a policy-denied error to the model |
 
 ### Native elicitation strategies
 
@@ -128,7 +130,7 @@ and relay the vendor's conversation into the Omnigent session.
 | **Model override** | User can select a model at launch or per-prompt |
 | **Auth** | Vendor login / config / token |
 | **Streaming (forwarder)** | `deltas` (token-level) vs `complete-only` (full response after completion) |
-| **Omnigent policies** | Whether the native harness enforces Omnigent-side tool policies — hook DENY, policy engine |
+| **Omnigent policies** | Whether the native harness enforces Omnigent-side tool policies — must support ALLOW, ASK, and DENY verdicts for both tool calls and tool results |
 | **Native elicitation (web)** | Whether the native harness surfaces tool-approval requests to the web UI — mirror+reply, permission.v2+reply |
 | **Interrupt** | User can abort a running turn |
 | **Bidirectional sync (TUI->Omni)** | TUI output mirrors into the Omnigent conversation |
