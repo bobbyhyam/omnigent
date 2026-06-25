@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
+    CodexNativeProcessOwnerLock,
+    acquire_codex_native_process_owner_lock,
     codex_native_session_tag_cmdline_arg,
     reconcile_codex_native_process_registry,
     register_codex_native_process,
@@ -511,6 +513,7 @@ class CodexNativeAppServer:
     policy_notice_pending: bool = False
     pinned_model: str | None = None
     process_registry_tag: str | None = None
+    process_owner_lock: CodexNativeProcessOwnerLock | None = None
 
     async def start(self) -> None:
         """
@@ -581,21 +584,30 @@ class CodexNativeAppServer:
         for override in self.config_overrides:
             argv.extend(["-c", override])
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
-        self.proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=proc_env,
-            cwd=str(self.cwd),
-            executable=self.codex_path,
-            start_new_session=(os.name == "posix"),
-        )
-        register_codex_native_process(
-            pid=self.proc.pid,
-            pgid=_process_group_id(self.proc),
-            session_tag=self.process_registry_tag,
-        )
+        self.process_owner_lock = acquire_codex_native_process_owner_lock()
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
+                cwd=str(self.cwd),
+                executable=self.codex_path,
+                start_new_session=(os.name == "posix"),
+            )
+        except BaseException:
+            if self.process_owner_lock is not None:
+                self.process_owner_lock.close()
+                self.process_owner_lock = None
+            raise
+        if self.process_owner_lock is not None:
+            register_codex_native_process(
+                pid=self.proc.pid,
+                pgid=_process_group_id(self.proc),
+                session_tag=self.process_registry_tag,
+                owner_lock_path=self.process_owner_lock.path,
+            )
         self.recent_stderr = []
         self.stderr_task = asyncio.create_task(
             self._stderr_loop(),
@@ -734,6 +746,8 @@ class CodexNativeAppServer:
                 await self.proc.wait()
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
+        if self.process_owner_lock is not None:
+            self.process_owner_lock.close()
         if self.stderr_task is not None:
             self.stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -741,6 +755,7 @@ class CodexNativeAppServer:
         self.proc = None
         self.stderr_task = None
         self.process_registry_tag = None
+        self.process_owner_lock = None
 
     async def _wait_until_ready(self) -> None:
         """

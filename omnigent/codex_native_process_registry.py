@@ -8,14 +8,21 @@ import logging
 import os
 import signal
 import subprocess
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from omnigent.codex_native_state import _codex_native_state_root
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock.
+    fcntl = None  # type: ignore[assignment]
+
 _logger = logging.getLogger(__name__)
 _REGISTRY_FILE = "process-registry.json"
+_OWNER_LOCK_DIR = "process-owners"
 _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
 
 
@@ -28,12 +35,42 @@ class CodexNativeProcessEntry:
     :param pgid: Child process group id.
     :param tmux_session_name: Optional tmux session name owned by the child.
     :param session_tag: Unique tag also embedded in the child command line.
+    :param owner_lock_path: Lock file held by the parent while it owns
+        the child. If the lock is still held during reconciliation, the
+        child is a live sibling and must not be reaped.
     """
 
     pid: int
     pgid: int
     tmux_session_name: str | None
     session_tag: str
+    owner_lock_path: str | None = None
+
+
+@dataclass
+class CodexNativeProcessOwnerLock:
+    """
+    Kernel-backed liveness handle for a native Codex launcher process.
+
+    :param path: Path to the owner lock file.
+    :param fd: Open file descriptor holding an exclusive flock.
+    """
+
+    path: Path
+    fd: int
+
+    def close(self) -> None:
+        """
+        Release the owner lock.
+
+        :returns: None.
+        """
+        with contextlib.suppress(OSError):
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(self.fd)
+        with contextlib.suppress(OSError):
+            self.path.unlink()
 
 
 def codex_native_process_registry_path() -> Path:
@@ -43,6 +80,34 @@ def codex_native_process_registry_path() -> Path:
     :returns: Registry path under the existing codex-native state root.
     """
     return _codex_native_state_root() / _REGISTRY_FILE
+
+
+def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | None:
+    """
+    Acquire a per-launcher owner lock for crash-safe reconciliation.
+
+    The lock is intentionally held by an open file descriptor for the
+    launcher process lifetime. If the launcher crashes, the OS releases
+    the flock, making its children eligible for the next reconciliation
+    sweep. A healthy concurrent launcher still holds the lock, so its
+    child entries are skipped even when their child PID/tag are live.
+
+    :returns: Held owner lock, or ``None`` if it could not be created.
+    """
+    if fcntl is None:
+        return None
+    root = _codex_native_state_root() / _OWNER_LOCK_DIR
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = root / f"{uuid.uuid4().hex}.lock"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _logger.warning("codex-native process owner lock create failed", exc_info=True)
+        with contextlib.suppress(NameError, OSError):
+            os.close(fd)  # type: ignore[possibly-undefined]
+        return None
+    return CodexNativeProcessOwnerLock(path=path, fd=fd)
 
 
 def codex_native_session_tag_cmdline_arg(session_tag: str) -> str:
@@ -63,6 +128,7 @@ def register_codex_native_process(
     pid: int,
     pgid: int,
     session_tag: str,
+    owner_lock_path: Path | str | None,
     tmux_session_name: str | None = None,
     registry_path: Path | None = None,
 ) -> None:
@@ -72,6 +138,7 @@ def register_codex_native_process(
     :param pid: Child process id.
     :param pgid: Child process group id.
     :param session_tag: Unique tag embedded in the child command line.
+    :param owner_lock_path: Lock file held by the launcher process.
     :param tmux_session_name: Optional tmux session name owned by the child.
     :param registry_path: Test override for the registry file path.
     :returns: None.
@@ -83,9 +150,12 @@ def register_codex_native_process(
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        owner_lock_path=str(owner_lock_path) if owner_lock_path is not None else None,
     )
     path = registry_path or codex_native_process_registry_path()
-    entries = [existing for existing in _read_registry(path) if existing.session_tag != session_tag]
+    entries = [
+        existing for existing in _read_registry(path) if existing.session_tag != session_tag
+    ]
     entries.append(entry)
     _write_registry(path, entries)
 
@@ -109,9 +179,7 @@ def unregister_codex_native_process(
     _write_registry(path, entries)
 
 
-def reconcile_codex_native_process_registry(
-    *, registry_path: Path | None = None
-) -> None:
+def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> None:
     """
     Reap crash-leftover native Codex children recorded by prior runs.
 
@@ -124,6 +192,9 @@ def reconcile_codex_native_process_registry(
     path = registry_path or codex_native_process_registry_path()
     survivors: list[CodexNativeProcessEntry] = []
     for entry in _read_registry(path):
+        if _owner_lock_held(entry.owner_lock_path):
+            survivors.append(entry)
+            continue
         if not _pid_alive(entry.pid):
             continue
         if not _process_cmdline_has_tag(entry.pid, entry.session_tag):
@@ -176,6 +247,7 @@ def _entry_from_json(item: Any) -> CodexNativeProcessEntry | None:
     pgid = item.get("pgid")
     session_tag = item.get("session_tag")
     tmux_session_name = item.get("tmux_session_name")
+    owner_lock_path = item.get("owner_lock_path")
     if not isinstance(pid, int) or pid <= 0:
         return None
     if not isinstance(pgid, int) or pgid <= 0:
@@ -184,12 +256,41 @@ def _entry_from_json(item: Any) -> CodexNativeProcessEntry | None:
         return None
     if tmux_session_name is not None and not isinstance(tmux_session_name, str):
         tmux_session_name = None
+    if owner_lock_path is not None and not isinstance(owner_lock_path, str):
+        owner_lock_path = None
     return CodexNativeProcessEntry(
         pid=pid,
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        owner_lock_path=owner_lock_path,
     )
+
+
+def _owner_lock_held(owner_lock_path: str | None) -> bool:
+    if not owner_lock_path:
+        return False
+    if fcntl is None:
+        return False
+    try:
+        fd = os.open(owner_lock_path, os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return True
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def _pid_alive(pid: int) -> bool:
