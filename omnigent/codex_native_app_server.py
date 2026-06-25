@@ -9,9 +9,9 @@ import logging
 import os
 import re
 import shlex
-import signal
 import sys
 import tempfile
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +23,15 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
 from omnigent.codex_native_bridge import write_policy_hook_config
+from omnigent.codex_native_process_registry import (
+    CodexNativeProcessOwnerLock,
+    acquire_codex_native_process_owner_lock,
+    codex_native_session_tag_cmdline_arg,
+    reconcile_codex_native_process_registry,
+    register_codex_native_process,
+    unregister_codex_native_process,
+)
+from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _clean_codex_env,
     _codex_cli_version,
@@ -588,6 +597,8 @@ class CodexNativeAppServer:
     policy_hook_disabled_reason: str | None = None
     policy_notice_pending: bool = False
     pinned_model: str | None = None
+    process_registry_tag: str | None = None
+    process_owner_lock: CodexNativeProcessOwnerLock | None = None
 
     async def start(self) -> None:
         """
@@ -642,6 +653,7 @@ class CodexNativeAppServer:
                     ap_server_url=self.ap_server_url,
                     ap_auth_headers=self.ap_auth_headers or {},
                 )
+        reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         # Opt-in, additive to the config.toml ``model =`` pin above: when the
@@ -658,8 +670,16 @@ class CodexNativeAppServer:
                 model_global_args = ["--model", self.pinned_model]
             else:
                 proc_env[_CODEX_MODEL_ENV_VAR] = self.pinned_model
+        # argv[0] carries the inert crash-reap marker (the real binary is passed
+        # via ``executable=`` below); the model global option rides after it so
+        # codex still parses it ahead of the ``app-server`` subcommand.
+        self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
+        tagged_argv0 = (
+            f"{Path(self.codex_path).name} "
+            f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
+        )
         argv = [
-            self.codex_path,
+            tagged_argv0,
             *model_global_args,
             "app-server",
             "--listen",
@@ -667,15 +687,30 @@ class CodexNativeAppServer:
         ]
         for override in self.config_overrides:
             argv.extend(["-c", override])
-        self.proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=proc_env,
-            cwd=str(self.cwd),
-            start_new_session=(os.name == "posix"),
-        )
+        self.process_owner_lock = acquire_codex_native_process_owner_lock()
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
+                cwd=str(self.cwd),
+                executable=self.codex_path,
+                **_proc.spawn_kwargs(),
+            )
+        except BaseException:
+            if self.process_owner_lock is not None:
+                self.process_owner_lock.close()
+                self.process_owner_lock = None
+            raise
+        if self.process_owner_lock is not None:
+            register_codex_native_process(
+                pid=self.proc.pid,
+                pgid=_process_group_id(self.proc),
+                session_tag=self.process_registry_tag,
+                owner_lock_path=self.process_owner_lock.path,
+            )
         self.recent_stderr = []
         self.stderr_task = asyncio.create_task(
             self._stderr_loop(),
@@ -812,12 +847,18 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
+        if self.process_registry_tag is not None:
+            unregister_codex_native_process(self.process_registry_tag)
+        if self.process_owner_lock is not None:
+            self.process_owner_lock.close()
         if self.stderr_task is not None:
             self.stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.stderr_task
         self.proc = None
         self.stderr_task = None
+        self.process_registry_tag = None
+        self.process_owner_lock = None
 
     async def _wait_until_ready(self) -> None:
         """
@@ -1672,14 +1713,20 @@ def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     :param process: Subprocess handle to terminate.
     :returns: None.
     """
-    if process.returncode is not None:
-        return
+    _proc.terminate_tree(process)
+
+
+def _process_group_id(process: asyncio.subprocess.Process) -> int:
+    """
+    Return the child process group id used for crash-safe reaping.
+
+    :param process: Subprocess handle.
+    :returns: Process group id, falling back to pid on non-POSIX hosts.
+    """
     if os.name == "posix":
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGTERM)
-            return
-    with contextlib.suppress(ProcessLookupError, Exception):
-        process.terminate()
+            return os.getpgid(process.pid)
+    return process.pid
 
 
 def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
@@ -1689,11 +1736,4 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
     :param process: Subprocess handle to kill.
     :returns: None.
     """
-    if process.returncode is not None:
-        return
-    if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGKILL)
-            return
-    with contextlib.suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)

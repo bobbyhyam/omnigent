@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import mimetypes
 import os
 import tarfile
 from collections.abc import AsyncIterator, Awaitable
@@ -18,6 +19,7 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from omnigent._platform import resolve_repo_symlink
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -75,10 +77,38 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _register_web_mimetypes() -> None:
+    """Pin Content-Type for web UI assets regardless of the OS MIME registry.
+
+    Starlette's ``StaticFiles`` derives ``Content-Type`` from
+    ``mimetypes.guess_type``. On Windows that consults the registry, where
+    ``.js`` is frequently mapped to ``text/plain`` — so the browser refuses to
+    execute the SPA's ES modules ("Loading module … was blocked because of a
+    disallowed MIME type"). Registering the web types explicitly makes the
+    bundled UI serve correctly on every platform and removes the dependency on
+    a machine's registry configuration.
+    """
+    for ext, ctype in (
+        (".js", "text/javascript"),
+        (".mjs", "text/javascript"),
+        (".css", "text/css"),
+        (".json", "application/json"),
+        (".map", "application/json"),
+        (".wasm", "application/wasm"),
+        (".svg", "image/svg+xml"),
+    ):
+        mimetypes.add_type(ctype, ext)
+
+
+_register_web_mimetypes()
+
 _WEB_UI_DIST = Path(__file__).parent / "static" / "web-ui"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
@@ -96,8 +126,10 @@ _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
 # seeder is a safety net.
-_DEBBY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "debby"
-_POLLY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "polly"
+# resolve_repo_symlink dereferences the packaged symlink on a no-symlink
+# Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
+_DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
+_POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
 
 
 class _FastAPICallNext(Protocol):
@@ -1632,6 +1664,19 @@ def create_app(
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
         sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        # smart_routing_enabled: true when the server can route — either
+        # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
+        # + llm: config) or the managed deployment registered a
+        # policy_llm_connection_factory (which means it has LLM capability
+        # and will supply its own RoutingClient).
+        try:
+            from omnigent.runtime._globals import _caps
+
+            smart_routing_enabled = _caps is not None and (
+                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
+            )
+        except ImportError:
+            smart_routing_enabled = False
         return {
             "accounts_enabled": accounts_enabled,
             "login_url": login_url,
@@ -1639,6 +1684,7 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
+            "smart_routing_enabled": smart_routing_enabled,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
@@ -2105,11 +2151,11 @@ class _SPAStaticFiles(StaticFiles):
     for the literal root and directory paths, so a refresh on
     ``/c/abc`` would 404.
 
-    The fallback is gated by an extension check: a path with a file
-    extension (``.js``, ``.css``, ``.png``, ``.woff2``, …) is treated as
-    an asset request and a 404 is returned verbatim — that surfaces
-    real broken-asset bugs rather than masking them with the HTML
-    shell. Extensionless paths fall back to ``index.html``.
+    The fallback is gated by an API-prefix and extension check: unmatched
+    ``/v1`` / ``/api`` / ``/auth`` / ``/health`` paths return a JSON 404,
+    and a path with a file extension (``.js``, ``.css``, ``.png``,
+    ``.woff2``, …) returns the static 404 verbatim. Other extensionless
+    paths fall back to ``index.html``.
     """
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -2130,12 +2176,39 @@ class _SPAStaticFiles(StaticFiles):
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
+            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "error": {
+                            "code": ErrorCode.NOT_FOUND,
+                            "message": "Not found",
+                        }
+                    },
+                )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
                 response = await super().get_response("index.html", scope)
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)
+
+
+def _is_web_ui_api_fallback_path(path: str) -> bool:
+    """
+    Return whether an unmatched static path belongs to the API namespace.
+
+    The web UI is mounted at ``/`` and receives every unmatched request after
+    the routers. Without this guard, an unknown API route such as
+    ``/v1/sessions/x/codex_goal`` is served the SPA shell as ``200 text/html``,
+    which makes browser clients fail with a JSON parse error instead of a
+    route-level 404.
+
+    :param path: Static mount-relative path, e.g. ``"v1/sessions/x"``.
+    :returns: True for paths that should never fall back to ``index.html``.
+    """
+    first_segment = path.lstrip("/").split("/", 1)[0]
+    return first_segment in _WEB_UI_API_FALLBACK_PREFIXES
 
 
 class _RangeAwareGZipMiddleware(GZipMiddleware):

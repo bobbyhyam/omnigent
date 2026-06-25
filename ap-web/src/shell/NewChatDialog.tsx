@@ -1,4 +1,4 @@
-import { type DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -414,8 +414,77 @@ export function harnessUnconfiguredOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): boolean {
-  if (!harness || !host?.configured_harnesses) return false;
-  return host.configured_harnesses[harness] === false;
+  return harnessUnavailableReasonOnHost(harness, host) !== null;
+}
+
+function isCodexHarness(harness: string): boolean {
+  return harness === "codex" || harness === "codex-native" || harness === "native-codex";
+}
+
+export function harnessUnavailableReasonOnHost(
+  harness: string | null | undefined,
+  host: Host | undefined | null,
+): string | null {
+  if (!harness || !host?.configured_harnesses) return null;
+  const availability = host.configured_harnesses[harness];
+  if (availability === false) return isCodexHarness(harness) ? "binary-missing" : "unconfigured";
+  if (
+    isCodexHarness(harness) &&
+    (availability === "binary-missing" || availability === "needs-auth")
+  ) {
+    return availability;
+  }
+  // Unknown future reason strings fall through to no warning until the UI knows their copy.
+  return null;
+}
+
+export function harnessWarningBadgeText(reason: string | null): string {
+  if (reason === "binary-missing") return "binary missing";
+  if (reason === "needs-auth") return "needs auth";
+  return "needs setup";
+}
+
+export function harnessWarningMessageText(
+  agentName: string | undefined,
+  hostName: string | undefined,
+  reason: string | null,
+): string {
+  if (reason === "needs-auth") {
+    return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
+  }
+  if (reason === "binary-missing") {
+    return `${agentName} is missing the Codex binary on ${hostName} — run omnigent setup on that machine.`;
+  }
+  return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
+}
+
+function harnessWarningMessage(
+  agentName: string | undefined,
+  hostName: string | undefined,
+  reason: string | null,
+): ReactNode {
+  if (reason === "needs-auth") {
+    return (
+      <>
+        {agentName} needs Codex authentication on {hostName} — run <code>codex login</code> on that
+        machine.
+      </>
+    );
+  }
+  if (reason === "binary-missing") {
+    return (
+      <>
+        {agentName} is missing the Codex binary on {hostName} — run <code>omnigent setup</code> on
+        that machine.
+      </>
+    );
+  }
+  return (
+    <>
+      {agentName} isn&apos;t configured on {hostName} — run <code>omnigent setup</code> on that
+      machine.
+    </>
+  );
 }
 
 /**
@@ -742,7 +811,7 @@ function BrainHarnessOptions({
                 className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                 data-testid={`new-chat-landing-harness-warning-${id}`}
               >
-                needs setup
+                {harnessWarningBadgeText(harnessUnavailableReasonOnHost(id, host))}
               </Badge>
             )}
           </DropdownMenuRadioItem>
@@ -849,6 +918,7 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
@@ -995,6 +1065,10 @@ export function NewChatLandingScreen() {
   // call surfaces a specific error if the harness really can't run.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   const selectedAgentUnconfigured = harnessUnconfiguredOnHost(
+    selectedAgent?.harness,
+    harnessWarningHost,
+  );
+  const selectedAgentUnavailableReason = harnessUnavailableReasonOnHost(
     selectedAgent?.harness,
     harnessWarningHost,
   );
@@ -1211,7 +1285,9 @@ export function NewChatLandingScreen() {
             className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
             data-testid={`new-chat-landing-agent-warning-${agent.id}`}
           >
-            needs setup
+            {harnessWarningBadgeText(
+              harnessUnavailableReasonOnHost(agent.harness, harnessWarningHost),
+            )}
           </Badge>
         )}
       </DropdownMenuItem>
@@ -1291,11 +1367,6 @@ export function NewChatLandingScreen() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             agent_id: effectiveAgentId,
-            // Managed (cloud sandbox) creates let the server provision the
-            // host: the schema rejects host_id and path workspaces (and git
-            // needs a host_id). The optional repository inputs compose into
-            // the URL-form workspace the server clones; undefined (no repo)
-            // is dropped by JSON.stringify.
             ...(sandboxSelected
               ? {
                   host_type: "managed",
@@ -1308,14 +1379,7 @@ export function NewChatLandingScreen() {
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
                     : undefined,
                 }),
-            // Native terminal agents open terminal-first: `omnigent.ui:
-            // terminal` tells the UI to render the terminal wrapper, and
-            // `omnigent.wrapper` selects which CLI bridge the runner launches.
-            // The values are the registered wrapper ids the runner keys off —
-            // they must match the wrapper registry, not the agent display name.
             labels: nativeLabels,
-            // Permission / approval / cursor mode → CLI flag pair, persisted as
-            // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args:
               agentSupportsPermissionMode &&
               permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
@@ -1325,14 +1389,8 @@ export function NewChatLandingScreen() {
                   : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
                     : undefined,
-            // Cost-control switch from the "Cost Optimized" pill; polly-only
-            // (cost control is a polly feature) and omitted when unset so the
-            // session defers to the spec default.
-            cost_control_mode_override:
-              agent?.name === "polly" ? (costControlMode ?? undefined) : undefined,
-            // Brain-harness pick from the agent flyout. Omitted when the user
-            // kept the spec default (pickedHarness is null) so the session
-            // tracks the agent's declared harness.
+            // Smart routing toggle — server-side, available for any agent.
+            cost_control_mode_override: costControlMode ?? undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });
@@ -1608,11 +1666,7 @@ export function NewChatLandingScreen() {
                 />
               </div>
               <div className="flex items-center gap-0.5">
-                {/* Polly-only surface — cost control is a polly feature, so
-                    the toggle is hidden unless the selected agent is polly. */}
-                {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
-                {false && selectedAgent?.name === "polly" && (
-                  // Mode-only variant: no verdict can exist before the session does.
+                {smartRoutingEnabled && selectedAgent && (
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
                 {agentList.length > 0 ? (
@@ -2096,8 +2150,11 @@ export function NewChatLandingScreen() {
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
               <span>
-                {selectedAgent?.display_name} isn&apos;t configured on {harnessWarningHost?.name} —
-                run <code>omnigent setup</code> on that machine.
+                {harnessWarningMessage(
+                  selectedAgent?.display_name,
+                  harnessWarningHost?.name,
+                  selectedAgentUnavailableReason,
+                )}
               </span>
             </p>
           )}

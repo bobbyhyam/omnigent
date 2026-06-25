@@ -983,6 +983,13 @@ def _patch_start_spawn(monkeypatch: pytest.MonkeyPatch, recorder: _SpawnRecorder
     monkeypatch.setattr(
         "omnigent.codex_native_app_server.asyncio.create_subprocess_exec", recorder._record
     )
+    # The crash-reap registration path (added alongside this flag) is exercised
+    # by the process-registry tests; these flag tests only assert argv/env, so
+    # skip registration by denying the owner lock (the recorder has no pid).
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.acquire_codex_native_process_owner_lock",
+        lambda: None,
+    )
 
     async def _noop_stderr(self: CodexNativeAppServer) -> None:
         return None

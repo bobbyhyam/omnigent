@@ -91,6 +91,7 @@ from omnigent.model_override import model_family_mismatch, validate_model_overri
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
+    CURSOR_NATIVE_CODING_AGENT,
     NativeCodingAgent,
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -511,6 +512,7 @@ _CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
+_CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -7983,6 +7985,117 @@ async def _persist_session_event(
     return item_id
 
 
+def _extract_user_text_for_routing(body: SessionEventInput) -> str:
+    """Extract plain text from a user message event for the routing judge.
+
+    Concatenates all ``input_text`` blocks in ``body.data["content"]``,
+    returning the first 4 000 characters.  Returns ``""`` for non-message
+    events or events with no text content.
+    """
+    content = body.data.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "input_text":
+            text = block.get("text", "")
+            if isinstance(text, str):
+                parts.append(text)
+    return " ".join(parts)[:4000]
+
+
+async def _emit_server_routing_decision(
+    session_id: str,
+    conversation_store: ConversationStore,
+    model: str,
+    verdict: dict[str, Any],
+) -> None:
+    """Persist and publish a ``routing_decision`` transcript chip.
+
+    Called by the server-side routing path before the turn is forwarded
+    to the runner.  The chip shows the judge's model pick at turn start
+    — the same UX the runner-side advisor produced, but driven entirely
+    by the server.
+    """
+    import uuid
+
+    from omnigent.runtime import session_stream
+
+    tier = verdict.get("tier", "medium")
+    rationale = verdict.get("rationale", "")
+    item_data = {
+        "model": model,
+        "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
+        "applied": True,
+        "rationale": rationale if isinstance(rationale, str) else "",
+    }
+    try:
+        parsed_data = parse_item_data("routing_decision", item_data)
+    except (ValueError, TypeError):
+        _logger.warning("Server routing: failed to parse routing_decision data")
+        return
+
+    routing_item = NewConversationItem(
+        type="routing_decision",
+        response_id=f"routing_{uuid.uuid4().hex}",
+        data=parsed_data,
+    )
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, [routing_item])
+        persisted_id: str | None = persisted[0].id if persisted else None
+    except Exception:
+        _logger.exception(
+            "Server routing: routing_decision persist failed for session=%s",
+            session_id,
+        )
+        persisted_id = None
+
+    # Persist the verdict as a session label so the AgentInfo popover's
+    # "Intelligent model router" section can read it (it uses
+    # parseCostRoutingVerdict which reads the cost_control.plan label).
+    try:
+        import datetime
+
+        from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL
+
+        label_value = json.dumps(
+            {
+                "version": 3,
+                "tier": item_data["tier"],
+                "model": model,
+                "applied": True,
+                "rationale": item_data["rationale"],
+                "turn_anchor": datetime.datetime.now(tz=datetime.UTC).isoformat(),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {COST_CONTROL_PLAN_LABEL: label_value},
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "Server routing: failed to persist verdict label for session=%s",
+            session_id,
+            exc_info=True,
+        )
+
+    # Publish live event so the web UI renders the chip immediately.
+    session_stream.publish(
+        session_id,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": persisted_id,
+                "type": "routing_decision",
+                **item_data,
+            },
+        },
+    )
+
+
 async def _forward_event_to_runner(
     session_id: str,
     conv: Conversation,
@@ -8122,6 +8235,49 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # ── Server-side intelligent routing ──────────────────────────────
+    # When the session toggle is ON and no model has been chosen yet,
+    # call the judge LLM on the FIRST message to pick the model for
+    # the entire session.  The verdict is persisted as model_override
+    # on the conversation so subsequent turns reuse it without another
+    # judge call.
+    if (
+        effective_runner_override is None
+        and conv.cost_control_mode_override == "on"
+        and body.type == "message"
+    ):
+        from omnigent.server.smart_routing import route_turn
+
+        _harness = _resolve_harness(conv)
+        _user_text = _extract_user_text_for_routing(body)
+        if _user_text:
+            _routed_model, _verdict = await route_turn(_harness, _user_text)
+            if _routed_model is not None:
+                effective_runner_override = _routed_model
+                # Persist as the session's model_override so all
+                # subsequent turns use this model automatically.
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        session_id,
+                        model_override=_routed_model,
+                    )
+                except (OSError, ValueError):
+                    _logger.warning(
+                        "smart_routing: failed to persist model_override "
+                        "for session=%s; turn still uses routed model",
+                        session_id,
+                        exc_info=True,
+                    )
+                # Emit the routing_decision transcript chip so the UI
+                # shows which model was picked, before the turn output.
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict or {},
+                )
+    # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
@@ -8292,6 +8448,38 @@ async def _dispatch_session_event_to_runner(
             if isinstance(content, list) and content
             else None
         )
+        # ── Server-side routing for native terminal sessions ────────
+        # Same logic as the SDK path in _forward_event_to_runner: if
+        # the toggle is on and no model_override is set, call the
+        # judge and persist the chosen model on the conversation row.
+        # The native CLI reads model_override from the session.
+        if conv.model_override is None and conv.cost_control_mode_override == "on":
+            from omnigent.server.smart_routing import route_turn
+
+            _harness = _resolve_harness(conv)
+            _user_text = _extract_user_text_for_routing(body)
+            if _user_text:
+                _routed_model, _verdict = await route_turn(_harness, _user_text)
+                if _routed_model is not None:
+                    try:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            model_override=_routed_model,
+                        )
+                    except (OSError, ValueError):
+                        _logger.warning(
+                            "smart_routing: persist failed for native session=%s",
+                            session_id,
+                            exc_info=True,
+                        )
+                    await _emit_server_routing_decision(
+                        session_id,
+                        conversation_store,
+                        _routed_model,
+                        _verdict or {},
+                    )
+        # ────────────────────────────────────────────────────────────
         forwarded = False
         try:
             await _forward_native_terminal_message(
@@ -8458,6 +8646,51 @@ def _resource_event_item_from_sse(
             resource_type=resource_type,
             resource=resource,
         ),
+    )
+
+
+def _routing_decision_item_from_sse(
+    event: dict[str, Any],
+) -> NewConversationItem | None:
+    """
+    Build a ``routing_decision`` conversation item from a runner SSE event.
+
+    The runner's cost advisor emits a ``response.output_item.done`` with a
+    ``routing_decision`` item at the START of an advised turn (the
+    intelligent model router's pick). This produces the durable,
+    display-only transcript item so the pick survives reload at the right
+    position (BEFORE the turn's assistant output); the relay also
+    re-publishes a live event carrying the persisted item id so the live
+    chip and a turn-start snapshot refetch dedup by the same id (no
+    double render).
+
+    Returns ``None`` for every other event, and for a malformed routing
+    item (empty model / unknown tier) so a bad frame can't poison the
+    relay.
+
+    :param event: Parsed SSE event dict from the runner stream.
+    :returns: A ``routing_decision`` :class:`NewConversationItem`, or
+        ``None``.
+    """
+    if event.get("type") != "response.output_item.done":
+        return None
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "routing_decision":
+        return None
+    try:
+        data = parse_item_data("routing_decision", item)
+    except (ValueError, TypeError):
+        _logger.warning("Failed to parse routing_decision item from SSE")
+        return None
+    # No turn response_id exists yet (emitted before response.in_progress),
+    # so stamp a fresh routing id — the chip renders as its own standalone
+    # line at turn start.
+    import uuid
+
+    return NewConversationItem(
+        type="routing_decision",
+        response_id=f"routing_{uuid.uuid4().hex}",
+        data=data,
     )
 
 
@@ -9020,6 +9253,43 @@ async def _relay_runner_stream(
                         ):
                             _publish_terminal_pending(session_id, False)
 
+                    # Intelligent-model-router decision emitted by the runner's
+                    # cost advisor at turn start. Persist as a display-only
+                    # transcript item (arrival order = BEFORE the assistant
+                    # output), then re-publish the live event carrying the
+                    # store-assigned id so the live chip and a turn-start
+                    # snapshot refetch dedup by the same id. Handled
+                    # exclusively here (persist + publish + continue) so the
+                    # raw, id-less runner event is not also forwarded below.
+                    routing_item = _routing_decision_item_from_sse(event)
+                    if routing_item is not None:
+                        # Persist failure must NOT suppress the live chip
+                        # (the owner's hard requirement: the pick shows the
+                        # moment the turn starts). On a store error, log and
+                        # still publish the live event — id-less, so a later
+                        # snapshot can't dedup it, but a missing reload chip
+                        # beats no chip at all.
+                        try:
+                            persisted = await asyncio.to_thread(
+                                conversation_store.append, session_id, [routing_item]
+                            )
+                            _persisted_id: str | None = persisted[0].id if persisted else None
+                        except Exception:
+                            _logger.exception(
+                                "Relay: routing_decision persist failed for session=%s; "
+                                "publishing the live chip without a durable id",
+                                session_id,
+                            )
+                            _persisted_id = None
+                        session_stream.publish(
+                            session_id,
+                            {
+                                **event,
+                                "item": {**event["item"], "id": _persisted_id},
+                            },
+                        )
+                        continue
+
                     # Accumulate LLM token usage from the harness
                     # response so policy callables can read
                     # event["context"]["usage"]["total_cost_usd"].
@@ -9453,29 +9723,42 @@ def _agent_is_native(agent: Agent) -> bool:
     return is_native_harness(spec.executor.harness_kind)
 
 
-# Native harnesses that record a resumable session and can rebuild a fork's
-# transcript from copied Omnigent items. Both spellings are listed because
-# canonicalize_harness passes the reversed native ids through unchanged (only
-# "native-pi" is aliased) — same reasoning as model_override._CLAUDE_FAMILY_HARNESSES.
-# cursor/pi native are intentionally absent: they can't replay fork history.
+# Native harnesses that rebuild a resumable on-disk transcript from the copied
+# Omnigent items and relaunch the CLI with --resume, so prior turns reappear as
+# native chat history. Used by BOTH fork and switch-agent. Both spellings are
+# listed because canonicalize_harness passes the reversed native ids through
+# unchanged (only "native-pi" is aliased) — same reasoning as
+# model_override._CLAUDE_FAMILY_HARNESSES.
+#
+# cursor is intentionally absent here: its conversation is server-backed (a
+# synthesized/cloned local store.db is NOT loaded by `cursor-agent --resume`),
+# so it can't rebuild a transcript. Instead a FORK carries cursor history as a
+# text preamble (see _CURSOR_FORK_HISTORY_HARNESSES below) — switch-agent keeps
+# the current fresh-launch behavior. pi has no carry-history path yet.
 _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
     {"claude-native", "native-claude", "codex-native", "native-codex"}
 )
 
+# Native harnesses that carry FORK history as a text preamble (text-prefix
+# replay) instead of a rebuilt transcript. Fork-only — switch-agent does not
+# use this set, so switching into cursor still launches fresh. The runner
+# branches on the harness to choose preamble vs transcript rebuild (see
+# _auto_create_cursor_terminal / cursor_native_executor).
+_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+
 
 def _agent_carries_native_fork_history(agent: Agent) -> bool:
-    """Return whether *agent*'s native harness can replay fork history.
+    """Return whether *agent*'s native harness rebuilds a fork's transcript.
 
-    Only claude-native / codex-native record a resumable native session and
-    can rebuild a fork's transcript from the copied Omnigent items. cursor-
-    native and pi-native are native CLIs but cannot carry chat history into a
-    fork (no resumable external_session_id and their TUIs can't import a
-    transcript), so stamping ``carry_history_into_native`` for them would be a
-    false promise — the fork launches fresh regardless. Returns ``False`` when
-    the bundle can't be loaded (treated as non-carrying).
+    Only claude-native / codex-native record a resumable native session and can
+    rebuild a fork's transcript from the copied Omnigent items. Used by both
+    fork and switch-agent. cursor carries fork history a different way (a text
+    preamble, fork-only — see :func:`_agent_carries_cursor_fork_history`); pi has
+    no carry-history path yet. Returns ``False`` when the bundle can't be loaded
+    (treated as non-carrying).
 
     :param agent: The agent whose harness to classify.
-    :returns: ``True`` only for fork-history-capable native harnesses.
+    :returns: ``True`` only for transcript-rebuild native harnesses.
     """
     from omnigent.harness_aliases import canonicalize_harness
 
@@ -9488,6 +9771,31 @@ def _agent_carries_native_fork_history(agent: Agent) -> bool:
     except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-carrying
         return False
     return canonicalize_harness(spec.executor.harness_kind) in _FORK_HISTORY_NATIVE_HARNESSES
+
+
+def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
+    """Return whether *agent* is cursor-native (carries FORK history via preamble).
+
+    Cursor's conversation is server-backed, so a fork can't seed a local store
+    for ``--resume``; instead the runner replays the prior turns as a text
+    preamble on the fork's first message. Fork-only — switch-agent does not call
+    this, so switching into cursor still launches fresh. Returns ``False`` when
+    the bundle can't be loaded.
+
+    :param agent: The agent whose harness to classify.
+    :returns: ``True`` only for the cursor-native harness (either spelling).
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-carrying
+        return False
+    return canonicalize_harness(spec.executor.harness_kind) in _CURSOR_FORK_HISTORY_HARNESSES
 
 
 def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
@@ -13739,6 +14047,19 @@ def create_sessions_router(
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
 
+    # ── Codex-native goal controls ───────────────────────────────
+
+    from omnigent.server.routes.codex.sessions import register_codex_session_routes
+
+    register_codex_session_routes(
+        router,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        runner_exit_reports=runner_exit_reports,
+    )
+
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
     @router.patch(
@@ -14267,18 +14588,26 @@ def create_sessions_router(
         # items (the converters consume Omnigent's normalized item shape, so
         # the source harness doesn't matter). SDK targets replay the
         # transcript as context regardless, so the marker is inert for them.
-        # Only claude/codex native can replay fork history; cursor/pi native
-        # can't (no resumable session, TUI can't import a transcript), so don't
-        # stamp a carry-history promise they'd silently break with a fresh launch.
-        carry_history_into_native = await asyncio.to_thread(
+        # claude/codex native rebuild the transcript; cursor native instead
+        # replays prior turns as a text preamble (its conversation is
+        # server-backed, so a local store can't be seeded — fork-only, see
+        # _agent_carries_cursor_fork_history). pi has no carry path yet, so don't
+        # stamp a promise it would break with a fresh launch. The single
+        # FORK_CARRY_HISTORY label drives both; the runner branches on harness.
+        target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, base_agent)
+        carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
         )
         # The source's native session id is only resumable by a target in the
         # SAME provider family — a Claude target can't clone a Codex rollout.
         # Cross-family, the store must skip the fork-source directive so the
         # runner takes the rebuild path instead of a doomed clone attempt
-        # (a failed clone launches fresh, losing history).
-        resume_source_native_session = not switching_agent or copy_model_settings
+        # (a failed clone launches fresh, losing history). cursor never clones a
+        # native session (server-backed; it carries history via the preamble),
+        # so it always skips the source directive too.
+        resume_source_native_session = (
+            not switching_agent or copy_model_settings
+        ) and not target_is_cursor
 
         # On an agent switch, recompute the Web UI presentation labels for
         # the TARGET harness so the clone isn't left in the source's UI mode
@@ -15354,6 +15683,18 @@ def create_sessions_router(
         operation_type = payload.get("operation_type")
         if not isinstance(operation_type, str) or not operation_type:
             operation_type = "tool"
+        # Structured AskQuestion payload (cursor's multiple-choice tool): when
+        # present, stamp it as the ``ask_user_question`` extra so the web UI
+        # renders the interactive form from it directly. ``content_preview`` is
+        # hard-capped at 1024 chars, which truncates a multi-question payload and
+        # breaks the preview-parse fallback — the structured field has no such
+        # cap and is the authoritative source the UI consumes when present.
+        extras: dict[str, Any] = {}
+        ask_user_question = payload.get("ask_user_question")
+        if isinstance(ask_user_question, dict) and isinstance(
+            ask_user_question.get("questions"), list
+        ):
+            extras["ask_user_question"] = ask_user_question
         params = ElicitationRequestParams(
             mode="form",
             message=message,
@@ -15362,6 +15703,7 @@ def create_sessions_router(
             phase="pre_tool_use",
             policy_name="cursor_native_permission",
             content_preview=content_preview,
+            **extras,
         )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
@@ -17573,7 +17915,27 @@ def create_sessions_router(
                     "external_session_status data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            _publish_status(session_id, status, response_id=response_id)
+            # Surface the failure reason a native forwarder carries so a
+            # top-level session sees it on its own status edge and persisted
+            # last_task_error, not only the sub-agent parent-inbox path.
+            output = body.data.get("output")
+            status_error: ErrorDetail | None = None
+            if status == "failed" and isinstance(output, str) and output.strip():
+                status_error = ErrorDetail(
+                    code=(
+                        "codex_reauth_required"
+                        if body.data.get("reauth_required") is True
+                        else "codex_turn_error"
+                    ),
+                    message=output.strip(),
+                )
+            if status_error is not None:
+                await _persist_session_status_error_labels(
+                    session_id, status_error, conversation_store
+                )
+            elif status == "running":
+                await _persist_session_status_error_labels(session_id, None, conversation_store)
+            _publish_status(session_id, status, status_error, response_id=response_id)
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
@@ -19064,28 +19426,55 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     return options
 
 
+# Native harnesses whose model picker is populated from a *live*, runner-owned
+# model-options endpoint, keyed by wrapper label -> the runner route segment.
+# Codex queries its live app-server ``model/list`` (account/session-scoped, so
+# it must come from the bound runner). Cursor is deliberately NOT here: its
+# catalog is a curated *static* base list served directly (see
+# ``_fetch_model_options``), which keeps it off the runner-backed cache that
+# ``refresh_state`` invalidates — otherwise an effort/model change would blank
+# the cursor picker mid-session.
+_MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+}
+
+
 async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
 ) -> list[dict[str, Any]]:
     """
-    Fetch cached Codex model options for a codex-native session.
+    Resolve the Web UI model-picker options for a native session.
 
-    The bound runner owns this query because only it can reach the live
-    Codex app-server socket. Like skills, this stays off the snapshot hot
-    path: the first snapshot kicks a background fetch and returns ``[]``;
-    subsequent snapshots serve the cache.
+    Two shapes:
+
+    * **cursor-native** — a curated *static* base catalog
+      (:func:`omnigent.cursor_native.cursor_base_model_options`), returned
+      directly on every snapshot. It deliberately bypasses the runner-backed
+      cache below: the catalog never changes per session, and routing it
+      through that cache would let a ``refresh_state`` snapshot (which pops the
+      cache) blank the picker on an effort/model change.
+    * **codex-native** — a *live*, account-scoped catalog only the bound runner
+      can read (its app-server ``model/list``). Like skills, this stays off the
+      snapshot hot path: the first snapshot kicks a background fetch and returns
+      ``[]``; subsequent snapshots serve the cache.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
-    :returns: Cached Codex options, or ``[]`` when not codex-native or not
-        yet available.
+    :returns: Model options, or ``[]`` when the session has no model picker or
+        the (codex) options are not yet available.
     """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper == _CURSOR_NATIVE_WRAPPER_LABEL_VALUE:
+        from omnigent.cursor_native import cursor_base_model_options
+
+        return cursor_base_model_options()
+    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
+    if endpoint is None:
         return []
     if runner_client is None:
         return []
@@ -19093,7 +19482,8 @@ async def _fetch_model_options(
     if cached is not None:
         return cached
     if session_id not in _model_options_inflight:
-        task = asyncio.create_task(_load_model_options(runner_client, session_id))
+        path = f"/v1/sessions/{session_id}/{endpoint}"
+        task = asyncio.create_task(_load_model_options(runner_client, session_id, path))
         _model_options_inflight[session_id] = task
         task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
     return []
@@ -19102,24 +19492,26 @@ async def _fetch_model_options(
 async def _load_model_options(
     runner_client: httpx.AsyncClient,
     session_id: str,
+    path: str,
 ) -> None:
     """
-    Background single-flight fetch of a session's Codex model catalog.
+    Background single-flight fetch of a session's native model catalog.
 
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param path: Runner route to query, e.g.
+        ``"/v1/sessions/conv_abc/cursor-model-options"``.
     """
-    path = f"/v1/sessions/{session_id}/codex-model-options"
     for attempt in range(len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
         try:
             resp = await runner_client.get(path, timeout=5.0)
         except (httpx.HTTPError, ConnectionError):
-            _logger.debug("Runner Codex model-options query failed for %s", session_id)
+            _logger.debug("Runner model-options query failed for %s", session_id)
             return
         if resp.status_code != 200:
-            # 503 means Codex's app-server bridge is still booting. Keep the
-            # background single-flight alive so the web picker fills without a
-            # second manual refresh.
+            # 503 means the native backend (Codex app-server bridge / cursor
+            # login) is still booting. Keep the background single-flight alive
+            # so the web picker fills without a second manual refresh.
             if resp.status_code == 503 and attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
                 await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
@@ -19127,7 +19519,7 @@ async def _load_model_options(
         try:
             options = _model_options_from_wire(resp.json().get("models", []))
         except (ValueError, KeyError, TypeError, ValidationError):
-            _logger.debug("Runner Codex model-options payload malformed for %s", session_id)
+            _logger.debug("Runner model-options payload malformed for %s", session_id)
             return
         if not options:
             # Older runners returned 200 + [] for the same not-ready window.
