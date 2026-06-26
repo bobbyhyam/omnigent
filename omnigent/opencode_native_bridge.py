@@ -86,8 +86,8 @@ const AUTH = process.env.OMNIGENT_POLICY_AUTH || "";
 const TIMEOUT_MS = 600000;
 
 async function evaluate(type, target, data) {
-  // Not wired (no server/session) -> no-op allow.
-  if (!BASE || !SESSION) return "ALLOW";
+  // Returns {result, reason}. Not wired (no server/session) -> no-op allow.
+  if (!BASE || !SESSION) return { result: "ALLOW" };
   const url = BASE + "/v1/sessions/" + encodeURIComponent(SESSION) + "/policies/evaluate";
   const headers = { "content-type": "application/json" };
   if (AUTH) headers["authorization"] = AUTH;
@@ -100,13 +100,13 @@ async function evaluate(type, target, data) {
       body: JSON.stringify({ event: { type: type, target: target || "", data: data } }),
       signal: controller.signal,
     });
-    if (!resp.ok) return "ALLOW";
+    if (!resp.ok) return { result: "ALLOW" };
     const body = await resp.json();
-    return body && typeof body.result === "string" ? body.result : "ALLOW";
+    return body && typeof body === "object" ? body : { result: "ALLOW" };
   } catch (e) {
     // Server unreachable / timeout: fail OPEN so a transient blip can't lock
     // the session. The web approval card (if any) stays parked server-side.
-    return "ALLOW";
+    return { result: "ALLOW" };
   } finally {
     clearTimeout(timer);
   }
@@ -133,8 +133,14 @@ export const OmnigentPolicyPlugin = async () => ({
     // expects for REQUEST (same shape claude's UserPromptSubmit hook sends);
     // a bare string 500s the evaluate endpoint and fails the gate open.
     const verdict = await evaluate("PHASE_REQUEST", "", { text: text });
-    if (verdict === "POLICY_ACTION_DENY") {
-      throw new Error("Blocked by Omnigent policy (request phase).");
+    if (verdict.result === "POLICY_ACTION_DENY") {
+      // opencode renders any thrown chat.message error as a generic 500 in the
+      // TUI ("Unexpected server error") — its middleware hardcodes that. We
+      // can't change the TUI text from a plugin, but the thrown message is
+      // written to opencode's session log, so carry the policy reason there.
+      throw new Error(
+        "Omnigent policy blocked this prompt: " + (verdict.reason || "request denied"),
+      );
     }
   },
   // TOOL_RESULT phase: gate/redact the tool output before the model sees it.
@@ -147,8 +153,9 @@ export const OmnigentPolicyPlugin = async () => ({
       input && input.tool,
       { result: output.output },
     );
-    if (verdict === "POLICY_ACTION_DENY") {
-      output.output = "[Omnigent policy: tool result withheld]";
+    if (verdict.result === "POLICY_ACTION_DENY") {
+      output.output = "[Omnigent policy withheld this tool result: " +
+        (verdict.reason || "denied") + "]";
     }
   },
 });
