@@ -10834,8 +10834,8 @@ def _run_configure_harnesses_interactive() -> None:
     provider and adopts any ambient-detected credential — announcing the
     newly auto-configured machine credentials in a callout — then loops on
     the level-1 harness overview. Every harness is shown on a single compact
-    row — the harness name on the left, a right-aligned ``✓``/``✗`` status on
-    the right (the configured credential, or "Not installed" / "No
+    row — the harness name on the left, then an aligned ``✓``/``✗`` status
+    column (the configured credential, or "Not installed" / "No
     credential") — in 0.3 priority order: Claude, Codex, Cursor, OpenCode,
     Hermes, Pi, then Antigravity, Qwen Code, Goose, Copilot, Kiro, Kimi Code.
     The actionable hint (install command / next step) renders only for the
@@ -10895,18 +10895,12 @@ def _run_configure_harnesses_interactive() -> None:
 
     # Backfill a databricks provider from a legacy global auth: block FIRST (it
     # outranks ambient detection in routing), then adopt ambient detections.
-    # The databricks backfill is silent (it just shows up in the harness summary
+    # The databricks backfill is silent (it just shows up in the harness status
     # line); newly-adopted machine credentials get a one-time callout naming
-    # what was auto-configured and from where. The detection scan can take a
-    # beat (on macOS it shells out to ``claude auth status`` to read the
-    # Keychain), so surface a spinner over just that step — it clears before the
-    # callout (and the menu) paints, and is a no-op off a TTY.
-    from omnigent._runner_startup import runner_startup_progress
-
-    with runner_startup_progress(
-        initial_message="Searching for existing credentials…"
-    ) as progress:
-        _adopt_ambient_credentials(progress=progress)
+    # what was auto-configured and from where. No progress spinner here: a
+    # transient spinner over the (fast) detection left a cleared-region gap and
+    # a residual line directly above the menu on first paint.
+    _adopt_ambient_credentials()
 
     # Level 1: pick a harness. The cursor moves between Claude, Codex, Pi, and
     # Quit; each harness's status renders as a non-selectable sub-line beneath
@@ -10948,8 +10942,8 @@ def _run_configure_harnesses_interactive() -> None:
     # Status glyph + Rich color per readiness kind: "ready" is a configured,
     # launchable harness (green ✓); "missing" is an absent CLI/SDK (red ✗);
     # "warn" is installed-but-unconfigured (yellow ✗ — present, not usable
-    # yet). The glyph rides the right-aligned status, not the name, so each row
-    # reads as one tidy "name … status" line.
+    # yet). The glyph leads the status, which sits in a left-aligned column
+    # right of the names, so every ✓/✗ lines up in a single column.
     status_styles = {"ready": ("✓", "green"), "missing": ("✗", "red"), "warn": ("✗", "yellow")}
 
     def _install_hint(command: str) -> str:
@@ -11171,36 +11165,28 @@ def _run_configure_harnesses_interactive() -> None:
         return rows
 
     # Cap the status text so one verbose row (e.g. an OpenCode summary listing
-    # several providers) can't widen the shared column and wrap the whole table
-    # on a narrow terminal.
+    # several providers) can't run off a narrow terminal.
     max_status_width = 30
 
     while True:
         config = _load_global_config()
         harness_rows = build_harness_rows()
-        # Right-align the status column to a shared edge so the overview reads
-        # as one compact "name … status" table. Widths are computed on the plain
-        # (markup-free) glyph + status, with a 2-space minimum gutter on the
-        # widest row; the status itself is escaped when interpolated into markup
-        # so a credential label containing a ``[`` can't parse as a Rich tag
-        # (descriptions are escaped the same way).
-        prepared: list[tuple[str, str, str, str, str, str]] = []
-        for target, name, status_text, kind, desc in harness_rows:
-            if len(status_text) > max_status_width:
-                status_text = status_text[: max_status_width - 1] + "…"
-            glyph, color = status_styles[kind]
-            prepared.append((target, name, status_text, glyph, color, desc))
-        content_w = max(
-            len(name) + 2 + len(f"{glyph} {status_text}")
-            for _target, name, status_text, glyph, _color, _desc in prepared
-        )
+        # Left-align the status into a single column a fixed gutter right of the
+        # names, so every ✓/✗ glyph lines up vertically (a ragged right-aligned
+        # status scattered the glyphs and read as messy). The name column is the
+        # widest harness name + a 2-space gutter; the status is escaped when
+        # interpolated into markup so a credential label containing a ``[`` can't
+        # parse as a Rich tag (descriptions are escaped the same way).
+        name_col = max(len(name) for _t, name, *_rest in harness_rows) + 2
         options: list[str] = []
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
-        for target, name, status_text, glyph, color, desc in prepared:
-            pad = content_w - len(name) - len(f"{glyph} {status_text}")
-            options.append(f"{name}{' ' * pad}[{color}]{glyph} {escape(status_text)}[/]")
+        for target, name, status_text, kind, desc in harness_rows:
+            if len(status_text) > max_status_width:
+                status_text = status_text[: max_status_width - 1] + "…"
+            glyph, color = status_styles[kind]
+            options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
             row_target.append(target)
             descriptions.append(desc)

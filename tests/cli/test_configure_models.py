@@ -9,8 +9,8 @@ shape, not just the command's exit code, so a regression in the
 add/set-default/remove write paths surfaces here rather than silently.
 
 ``configure harnesses`` is a **three-level** picker. Level 1 shows every
-harness on a single compact row — the name on the left, a right-aligned
-``✓``/``✗`` status on the right — in 0.3 priority order: ``1=Claude``,
+harness on a single compact row — the name on the left, then an aligned
+``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
 ``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
 ``12=Kimi Code``, ``13=Quit``. There is no "More" folding — every harness is
