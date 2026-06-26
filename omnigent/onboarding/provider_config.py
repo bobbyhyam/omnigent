@@ -80,11 +80,15 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # entry never carries a ``pi:`` block — but defaults are scoped per harness
 # surface, and pi consumes both families, so it gets its own scope name a
 # ``default:`` value may reference (``default: ["anthropic", "pi"]``).
-# Every provider kind except ``subscription`` can drive pi (a claude/codex
-# CLI login is unusable outside its own CLI), so only those kinds may claim
-# this scope. Resolution: an explicit pi default wins; otherwise pi falls
-# back to the anthropic then openai family default, skipping subscriptions
-# (see :func:`default_provider_for_harness`).
+# An inline key/gateway/local (with an anthropic/openai family) and a
+# databricks profile drive pi directly; a ``cli-config`` may claim the scope
+# too (a Databricks AI Gateway is pi-consumable — Pi speaks its Anthropic
+# surface), with the actual gateway capability validated at resolution time.
+# A ``subscription`` (CLI login, unusable outside its own CLI) and ``bedrock``
+# (native-``omnigent claude`` only) can never drive pi. Resolution: an
+# explicit pi default wins; otherwise pi falls back to the anthropic then
+# openai family default, skipping the non-pi kinds (see
+# :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
@@ -1124,13 +1128,15 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     default. The ``pi`` harness (and any unmapped harness) consumes both
     families: an explicit :data:`PI_SURFACE` default wins; otherwise it
     falls back to the ``anthropic`` then ``openai`` family default,
-    skipping ``subscription``, ``cli-config``, and ``bedrock`` defaults —
-    the first two live in the claude/codex CLI's own files an unmapped
-    harness can't read, and ``bedrock`` is native-``omnigent claude`` only.
-    Routing pi to any of them fails: ``configure_agent_harness_with_provider``
-    no-ops on subscription (spawning pi authless) and raises on cli-config
-    (non-codex) and bedrock. This mirrors :func:`provider_families`, which
-    never reports the :data:`PI_SURFACE` scope for these kinds.
+    skipping ``subscription`` and ``bedrock`` defaults (a CLI login is
+    unusable outside its own CLI, and ``bedrock`` is native-``omnigent
+    claude`` only — routing pi to either fails). A ``cli-config`` default is
+    skipped UNLESS it is a pi-consumable Databricks AI Gateway (see
+    :func:`_cli_config_serves_pi`): such a gateway exposes an Anthropic
+    surface Pi speaks natively, so pi-native translates it
+    (``_cli_config_pi_provider``) and the gateway-harness pi path routes it
+    (``configure_agent_harness_with_provider``). A non-Databricks cli-config
+    still falls through (it can't serve pi).
 
     :param config: The parsed config mapping (``providers:`` block).
     :param harness: The canonical harness name, e.g. ``"claude-sdk"`` or
