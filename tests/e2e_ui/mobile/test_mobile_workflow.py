@@ -29,8 +29,6 @@ import httpx
 import pytest
 from playwright.sync_api import Page, ViewportSize, expect
 
-from tests.e2e_ui.conftest import reset_mock_llm
-
 # iPhone-12-class portrait viewport — comfortably below the Tailwind
 # ``md`` breakpoint (768px) so every ``md:`` rule resolves to its
 # mobile branch.
@@ -185,7 +183,6 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
 def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
     page: Page,
     terminal_session: tuple[str, str],
-    mock_llm_server_url: str,
 ) -> None:
     """Shell-capable agents expose the mobile Shells drawer at zero shells.
 
@@ -208,7 +205,6 @@ def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
     drawer = page.get_by_test_id("shells-panel-drawer")
     expect(drawer).to_have_attribute("data-state", "open")
     expect(drawer.get_by_role("button", name="New shell")).to_be_visible()
-    reset_mock_llm(mock_llm_server_url)
 
 
 def test_mobile_fab_shows_agents_entry_when_child_agents_exist(
