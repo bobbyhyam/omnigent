@@ -21,52 +21,91 @@ import {
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
-/** Dot color from host status. */
-function hostTone(status: HostStatus): string {
-  if (!status.cliInstalled) return "bg-muted-foreground/40";
-  if (status.connected) return "bg-success";
-  if (status.process === "online") return "bg-warning";
-  return "bg-muted-foreground/40";
+/** What the row should display, derived from live status + any in-flight action. */
+interface Display {
+  /** Dot color class. */
+  tone: string;
+  /** Short word shown on the row next to the dot (e.g. "connecting…"), or null. */
+  hint: string | null;
+  /** Fuller line shown atop the menu. */
+  statusText: string;
+  /** Whether the thing is up (drives which actions show). */
+  active: boolean;
 }
 
-/** Status summary shown atop the host menu. */
-function hostText(status: HostStatus): string {
-  if (!status.cliInstalled) return "Omnigent CLI not found";
-  if (status.error) return status.error;
-  if (status.connected) {
-    return status.sessions > 0
-      ? `Connected · ${status.sessions} session${status.sessions === 1 ? "" : "s"}`
-      : "Connected";
+/** Host row display. A pending start/restart — or a live process that isn't yet
+ *  tunneled — reads as "connecting…". */
+function hostDisplay(status: HostStatus, pending: HostControlAction | null): Display {
+  const stopping = pending === "stop";
+  const connecting =
+    pending === "start" ||
+    pending === "restart" ||
+    (status.process === "online" && !status.connected);
+
+  let tone = "bg-muted-foreground/40";
+  if (status.cliInstalled) {
+    if (status.connected && !stopping) tone = "bg-success";
+    else if (connecting || stopping) tone = "bg-warning";
   }
-  if (status.process === "online") return "Connecting…";
-  return "Not hosting";
+
+  let statusText: string;
+  if (!status.cliInstalled) statusText = "Omnigent CLI not found";
+  else if (stopping) statusText = "Stopping…";
+  else if (connecting) statusText = "Connecting…";
+  else if (status.connected) {
+    statusText =
+      status.sessions > 0
+        ? `Connected · ${status.sessions} session${status.sessions === 1 ? "" : "s"}`
+        : "Connected";
+  } else if (status.error) statusText = status.error;
+  else statusText = "Not hosting";
+
+  return {
+    tone,
+    hint: stopping ? "stopping…" : connecting ? "connecting…" : null,
+    statusText,
+    active: status.connected || status.process === "online",
+  };
 }
 
-/** Status summary shown atop the local-server menu. */
-function serverText(server: LocalServerStatus): string {
-  if (!server.running) return "Stopped";
-  return server.liveSessions > 0 ? `Running · ${server.liveSessions} active` : "Running";
+/** Local-server row display. */
+function serverDisplay(server: LocalServerStatus, pending: HostControlAction | null): Display {
+  const stopping = pending === "stop";
+  const starting = pending === "start" || pending === "restart";
+
+  let tone = server.running ? "bg-success" : "bg-muted-foreground/40";
+  if (stopping || (starting && !server.running)) tone = "bg-warning";
+
+  let statusText: string;
+  if (stopping) statusText = "Stopping…";
+  else if (pending === "restart") statusText = "Restarting…";
+  else if (pending === "start") statusText = "Starting…";
+  else if (server.running) {
+    statusText = server.liveSessions > 0 ? `Running · ${server.liveSessions} active` : "Running";
+  } else statusText = "Stopped";
+
+  let hint: string | null = null;
+  if (stopping) hint = "stopping…";
+  else if (pending === "restart") hint = "restarting…";
+  else if (pending === "start") hint = "starting…";
+
+  return { tone, hint, statusText, active: server.running };
 }
 
 /**
  * A sidebar status row that opens a Start / Stop / Restart menu. The trigger
- * shows a title and a status dot; the menu's items enable/disable by whether
- * the thing is currently active, and everything is disabled while an action is
- * in flight or control isn't possible (CLI missing).
+ * shows a title, an optional transient hint (e.g. "connecting…"), and a status
+ * dot; the menu shows only the actions relevant to the current state.
  */
 function StatusMenu({
   title,
-  tone,
-  statusText,
-  active,
+  display,
   canControl,
   busy,
   onAction,
 }: {
   title: string;
-  tone: string;
-  statusText: string;
-  active: boolean;
+  display: Display;
   canControl: boolean;
   busy: boolean;
   onAction: (action: HostControlAction) => void;
@@ -81,18 +120,21 @@ function StatusMenu({
         )}
       >
         <span className="truncate">{title}</span>
-        <span aria-hidden className={cn("ml-auto size-2 shrink-0 rounded-full", tone)} />
+        <span className="ml-auto flex items-center gap-1.5">
+          {display.hint && <span className="text-xs">{display.hint}</span>}
+          <span aria-hidden className={cn("size-2 shrink-0 rounded-full", display.tone)} />
+        </span>
       </DropdownMenuTrigger>
       <DropdownMenuContent side="top" align="start" className="min-w-48">
         <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
-          {statusText}
+          {display.statusText}
         </DropdownMenuLabel>
-        {/* Actions depend on state: only Start when off, only Stop/Restart
-            when running. Nothing actionable when the CLI is missing. */}
+        {/* Actions depend on state: only Start when off, only Stop/Restart when
+            running. Nothing actionable when the CLI is missing. */}
         {canControl && (
           <>
             <DropdownMenuSeparator />
-            {!active && (
+            {!display.active && (
               <DropdownMenuItem
                 className="gap-2"
                 disabled={busy}
@@ -102,7 +144,7 @@ function StatusMenu({
                 Start
               </DropdownMenuItem>
             )}
-            {active && (
+            {display.active && (
               <>
                 <DropdownMenuItem
                   className="gap-2"
@@ -130,13 +172,14 @@ function StatusMenu({
 }
 
 /**
- * Desktop-shell host controls in the sidebar footer next to Settings.
+ * Desktop-shell host/server controls in the sidebar footer next to Settings.
  *
  * A "Host Status" row (this machine's host daemon) and — when connected to a
- * local server — a "Local Server Status" row. Each shows a status dot and opens
- * a Start / Stop / Restart menu driving the omnigent CLI through the shell.
- * Status is read live (`getHostStatus` + the shell's pushed updates); hosting
- * can also be opted into at connect time on the setup page.
+ * local server the CLI manages — a "Local Server Status" row. Each shows a
+ * status dot, a transient hint (e.g. "connecting…") while the tunnel comes up
+ * or an action runs, and a Start / Stop / Restart menu driving the omnigent CLI
+ * through the shell. Status is read live (`getHostStatus` + the shell's pushed
+ * updates); hosting can also be opted into at connect time on the setup page.
  *
  * Renders nothing outside the Electron shell or before the shell reports a
  * status. Desktop-only by layout (hidden on the narrow mobile sidebar).
@@ -144,7 +187,8 @@ function StatusMenu({
 export function HostStatusIndicator() {
   const [host, setHost] = useState<HostStatus | null>(null);
   const [server, setServer] = useState<LocalServerStatus | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [pendingHost, setPendingHost] = useState<HostControlAction | null>(null);
+  const [pendingServer, setPendingServer] = useState<HostControlAction | null>(null);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -171,41 +215,41 @@ export function HostStatusIndicator() {
 
   if (!host) return null;
 
-  const canControl = host.cliInstalled;
-  const hostActive = host.connected || host.process === "online";
-
-  const run =
-    (control: (action: HostControlAction) => Promise<unknown>) =>
-    async (action: HostControlAction) => {
-      setBusy(true);
-      try {
-        await control(action);
-      } finally {
-        refresh();
-        if (mounted.current) setBusy(false);
-      }
-    };
+  const runHost = async (action: HostControlAction) => {
+    setPendingHost(action);
+    try {
+      await controlHost(action);
+    } finally {
+      refresh();
+      if (mounted.current) setPendingHost(null);
+    }
+  };
+  const runServer = async (action: HostControlAction) => {
+    setPendingServer(action);
+    try {
+      await controlServer(action);
+    } finally {
+      refresh();
+      if (mounted.current) setPendingServer(null);
+    }
+  };
 
   return (
     <div className="max-md:hidden">
       <StatusMenu
         title="Host Status"
-        tone={hostTone(host)}
-        statusText={hostText(host)}
-        active={hostActive}
-        canControl={canControl}
-        busy={busy}
-        onAction={run(controlHost)}
+        display={hostDisplay(host, pendingHost)}
+        canControl={host.cliInstalled}
+        busy={pendingHost !== null}
+        onAction={(action) => void runHost(action)}
       />
       {server && (
         <StatusMenu
           title="Local Server Status"
-          tone={server.running ? "bg-success" : "bg-muted-foreground/40"}
-          statusText={serverText(server)}
-          active={server.running}
-          canControl={canControl}
-          busy={busy}
-          onAction={run(controlServer)}
+          display={serverDisplay(server, pendingServer)}
+          canControl
+          busy={pendingServer !== null}
+          onAction={(action) => void runServer(action)}
         />
       )}
     </div>
