@@ -503,6 +503,53 @@ def test_policy_server_5xx_fails_closed(tmp_path: Path) -> None:
     _run_policy_node_script(_extension_path(), tmp_path, body)
 
 
+def test_policy_4xx_fails_closed(tmp_path: Path) -> None:
+    """A 4xx response fails CLOSED immediately (no retry).
+
+    A 4xx is a final error (a bad request won't succeed on retry), so the gate
+    has no usable verdict and PHASE_TOOL_CALL must block rather than proceed.
+    Unlike a 5xx it is not charged against the transient budget, so it fails
+    closed on the first response.
+    """
+    body = r"""
+(async () => {
+  responders = [(_b) => makeJsonResponse({}, 400)];
+  const verdict = await runToolCall();
+  assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));
+  assert.match(verdict.reason, /failing closed/);
+  // A 4xx is final, not transient: one POST, no retries.
+  assert.equal(evalBodies.length, 1, "4xx must not retry, got " + evalBodies.length);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_policy_malformed_body_fails_closed(tmp_path: Path) -> None:
+    """A 200 response with an unparseable body fails CLOSED.
+
+    A malformed JSON body yields no verdict and is not retryable, so an
+    unevaluable PHASE_TOOL_CALL blocks rather than proceeds.
+    """
+    body = r"""
+(async () => {
+  responders = [
+    (_b) => ({ ok: true, status: 200, json: async () => { throw new Error("bad json"); } }),
+  ];
+  const verdict = await runToolCall();
+  assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));
+  assert.match(verdict.reason, /failing closed/);
+  assert.equal(evalBodies.length, 1, "malformed body must not retry, got " + evalBodies.length);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
 def test_policy_raw_ask_never_collapses_fails_closed(tmp_path: Path) -> None:
     """A raw ASK that never collapses fails CLOSED after the round cap (finding #2).
 
