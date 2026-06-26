@@ -338,6 +338,10 @@ class _CodexForwarderState:
     # identical posts when Codex signals completion via both a
     # ``contextCompaction`` item and a ``thread/compacted`` notification.
     compaction_status_posted: str | None = None
+    # Whether the compaction item has already been persisted for the current
+    # compaction boundary.  Reset to ``False`` when a new ``"in_progress"``
+    # status is posted.
+    compaction_item_persisted: bool = False
     # Codex reasoning item id whose live deltas are currently being mirrored.
     # When a delta arrives for a different item, it opens a new reasoning
     # block (``started=True`` → ``response.reasoning.started``). Reset at each
@@ -2650,12 +2654,16 @@ async def _maybe_handle_turn_event(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
-        try:
-            await _persist_codex_compaction_item(client, session_id=session_id)
-        except Exception:  # noqa: BLE001
-            _logger.warning(
-                "Failed to persist codex compaction item for %s", session_id, exc_info=True
-            )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(client, session_id=session_id)
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return True
     return False
 
@@ -3636,12 +3644,16 @@ async def _handle_completed_item(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
-        try:
-            await _persist_codex_compaction_item(client, session_id=session_id)
-        except Exception:  # noqa: BLE001
-            _logger.warning(
-                "Failed to persist codex compaction item for %s", session_id, exc_info=True
-            )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(client, session_id=session_id)
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return
     if not _claim_completed_item(params, item, forwarder_state):
         return
@@ -5012,6 +5024,8 @@ async def _post_compaction_status(
     _log_failed_session_event_post(_EXTERNAL_COMPACTION_STATUS_TYPE, response)
     if forwarder_state is not None and response is not None and response.status_code < 400:
         forwarder_state.compaction_status_posted = status
+        if status == "in_progress":
+            forwarder_state.compaction_item_persisted = False
 
 
 async def _persist_codex_compaction_item(
