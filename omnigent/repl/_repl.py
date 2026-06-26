@@ -532,34 +532,38 @@ def _render_startup_banner_ansi(
     return banner.ansi
 
 
-def _fetch_server_version(server_url: str | None) -> str | None:
+async def _fetch_server_version(client: OmnigentClient) -> str | None:
     """Best-effort ``GET /v1/info`` → ``server_version`` for the header row.
 
-    ``/v1/info`` is unauthed by design, so a plain short-timeout GET
-    suffices. Any failure — unreachable, slow, non-JSON, or a server too
-    old to report the field — returns ``None`` and the banner simply omits
-    the version row. A welcome-banner detail must never block or fail REPL
-    boot, so this swallows every error.
+    Routed through the REPL's already-connected :class:`OmnigentClient` so
+    the probe carries the SAME auth (bearer / cookie), base URL, and TLS /
+    custom-CA configuration the REPL is already using. ``/v1/info`` is NOT
+    universally unauthed — a hosted deployment (behind OIDC / accounts / a
+    Databricks front door) gates it like any other route, so a bare
+    credential-less GET would 401 and the version would silently never show
+    on exactly the remote servers where the URL row is displayed. Reusing
+    the authenticated client makes the probe answer there.
 
-    The timeout is kept tight and bounded *per phase* (connect / read /
-    write each 1.0s) so the worst case a healthy-but-slow or unreachable
-    server can add to the previously-instant banner stays small — the
-    connect phase, the dominant cost for an unreachable host, fails within
-    a second rather than the multi-second ceiling a single coarse timeout
-    could reach.
+    Because the client's ``httpx.AsyncClient`` is awaited directly (not run
+    on a thread), this never blocks the event loop. The timeout is kept
+    tight and bounded *per phase* (connect / read / write each 1.0s) so the
+    worst case a healthy-but-slow or unreachable server can add to the
+    previously-instant banner stays small — the connect phase, the dominant
+    cost for an unreachable host, fails within a second. Any failure —
+    unreachable, slow, 401/4xx/5xx, non-JSON, or a server too old to report
+    the field — returns ``None`` and the banner simply omits the version
+    row. A welcome-banner detail must never block or fail REPL boot, so this
+    swallows every error.
 
-    :param server_url: Base URL the REPL is connected to, e.g.
-        ``"https://omnigent.example.com"``; falsy short-circuits to
-        ``None``.
+    :param client: The connected client the REPL drives; its authenticated
+        ``_http`` and ``_base_url`` are reused for the probe.
     :returns: The installed server version string (e.g. ``"0.3.0.dev0"``),
         or ``None`` when it can't be resolved.
     """
-    if not server_url:
-        return None
     try:
         import httpx
 
-        resp = httpx.get(f"{server_url.rstrip('/')}/v1/info", timeout=httpx.Timeout(1.0))
+        resp = await client._http.get(f"{client._base_url}/v1/info", timeout=httpx.Timeout(1.0))
         version = resp.json().get("server_version")
     except Exception:  # noqa: BLE001 — startup-UI boundary: never block boot on a banner detail
         return None
@@ -4279,16 +4283,13 @@ async def run_repl(
             except Exception:  # noqa: BLE001 — startup-UI boundary: a config read must never block REPL boot
                 _log.exception("Failed to build startup header; falling back to plain banner")
         # Installed server version for the header's "server <ver>" row.
-        # Resolved off the event loop (a short-timeout GET /v1/info) so a
-        # slow probe never stalls boot; None on any failure simply omits the
-        # row. Only the header path renders the version, so skip the probe
-        # entirely on the minimal-banner fallback (no header) — no point
-        # paying even bounded latency for a value that won't be shown.
-        server_version = (
-            await asyncio.to_thread(_fetch_server_version, server_url)
-            if _header is not None
-            else None
-        )
+        # Probed via the connected (authenticated) client so a short, bounded
+        # GET /v1/info never stalls boot and answers even on auth-gated hosted
+        # servers; None on any failure simply omits the row. Only the header
+        # path renders the version, so skip the probe entirely on the
+        # minimal-banner fallback (no header) — no point paying even bounded
+        # latency for a value that won't be shown.
+        server_version = await _fetch_server_version(client) if _header is not None else None
         _sys.stdout.write(
             _render_startup_banner_ansi(
                 ui_name,

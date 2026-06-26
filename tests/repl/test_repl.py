@@ -1575,14 +1575,17 @@ def test_startup_header_omits_server_version_when_unresolved() -> None:
         ({"server_version": 3}, None),
     ],
 )
-def test_fetch_server_version_parses_info(monkeypatch, payload, expected) -> None:
+def test_fetch_server_version_parses_info(payload, expected) -> None:
     """``_fetch_server_version`` extracts a non-empty string ``server_version`` from /v1/info.
 
     What this proves: only a usable version string reaches the header; a
     missing field, empty string, or non-string is treated as "unknown"
     (``None``) so the banner never shows a garbage version. Also pins the
-    probe target to the unauthed ``/v1/info`` on the slash-normalized base.
+    probe to go through the client's AUTHENTICATED ``_http`` (so a hosted,
+    auth-gated server answers instead of 401-ing) at ``/v1/info`` on the
+    client's base URL.
     """
+    import asyncio
 
     class _FakeResp:
         def json(self) -> dict:
@@ -1590,37 +1593,41 @@ def test_fetch_server_version_parses_info(monkeypatch, payload, expected) -> Non
 
     captured: dict[str, object] = {}
 
-    def _fake_get(target: str, timeout: float = 0.0):
-        # ``timeout`` mirrors the real httpx.get keyword the helper passes;
-        # captured only so the call shape stays honest, not asserted.
-        captured["target"] = target
-        return _FakeResp()
+    class _FakeHttp:
+        async def get(self, target: str, timeout: object = None):
+            # The probe must ride the client's authed _http, not a bare
+            # httpx.get; capturing the target pins the URL it builds.
+            captured["target"] = target
+            return _FakeResp()
 
-    import httpx
+    class _FakeClient:
+        _base_url = "https://omnigent.example.com"
+        _http = _FakeHttp()
 
-    monkeypatch.setattr(httpx, "get", _fake_get)
-    assert _fetch_server_version("https://omnigent.example.com/") == expected
-    # Slash-normalized base + the unauthed capabilities probe path.
+    assert asyncio.run(_fetch_server_version(_FakeClient())) == expected
+    # Probe hits /v1/info on the client's base URL, through its authed _http.
     assert captured["target"] == "https://omnigent.example.com/v1/info"
 
 
-def test_fetch_server_version_never_raises(monkeypatch) -> None:
-    """A falsy URL short-circuits, and any probe error yields ``None`` (boot must not fail).
+def test_fetch_server_version_never_raises() -> None:
+    """Any probe error yields ``None`` (boot must not fail).
 
-    What this proves: the version probe is a non-blocking nicety — no
-    ``server_url``, or an ``httpx`` error mid-probe, returns ``None``
-    instead of propagating and taking down REPL boot.
+    What this proves: the version probe is a non-blocking nicety — an
+    ``httpx`` error mid-probe (including a 401 from an auth-gated server
+    that the client somehow can't satisfy, or a network drop) returns
+    ``None`` instead of propagating and taking down REPL boot.
     """
-    assert _fetch_server_version(None) is None
-    assert _fetch_server_version("") is None
+    import asyncio
 
-    def _boom(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("network down")
+    class _BoomHttp:
+        async def get(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("network down")
 
-    import httpx
+    class _FakeClient:
+        _base_url = "https://omnigent.example.com"
+        _http = _BoomHttp()
 
-    monkeypatch.setattr(httpx, "get", _boom)
-    assert _fetch_server_version("https://omnigent.example.com") is None
+    assert asyncio.run(_fetch_server_version(_FakeClient())) is None
 
 
 @pytest.mark.parametrize(
