@@ -629,9 +629,27 @@ function saveSettings(settings) {
  *
  * @returns {string | null}
  */
+/**
+ * Cached CLI resolution: { configuredPath, path }. Resolving runs `command -v`
+ * (a subprocess), so we memoize the found path and only re-probe when the
+ * configured override changes or the cached binary is no longer executable —
+ * avoiding a shell-out on every status/control call.
+ */
+let cachedCli = null;
+
 function resolvedCliPath() {
-  const resolved = omnigentCli.resolveCliPath(loadSettings().omnigent_path);
-  return resolved ? resolved.path : null;
+  const configured = loadSettings().omnigent_path ?? null;
+  if (
+    cachedCli &&
+    cachedCli.configuredPath === configured &&
+    cachedCli.path &&
+    omnigentCli.isExecutableFile(cachedCli.path)
+  ) {
+    return cachedCli.path;
+  }
+  const resolved = omnigentCli.resolveCliPath(configured);
+  cachedCli = { configuredPath: configured, path: resolved ? resolved.path : null };
+  return cachedCli.path;
 }
 
 /**

@@ -187,6 +187,7 @@ function StatusMenu({
 export function HostStatusIndicator() {
   const [host, setHost] = useState<HostStatus | null>(null);
   const [server, setServer] = useState<LocalServerStatus | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const [pendingHost, setPendingHost] = useState<HostControlAction | null>(null);
   const [pendingServer, setPendingServer] = useState<HostControlAction | null>(null);
   const mounted = useRef(true);
@@ -200,7 +201,9 @@ export function HostStatusIndicator() {
 
   const refresh = useCallback(() => {
     void getHostStatus().then((s) => {
-      if (mounted.current) setHost(s);
+      if (!mounted.current) return;
+      setHost(s);
+      setLoaded(true);
     });
     void getLocalServerStatus().then((s) => {
       if (mounted.current) setServer(s);
@@ -213,7 +216,16 @@ export function HostStatusIndicator() {
     return onHostStatusChanged(() => refresh());
   }, [refresh]);
 
-  if (!host) return null;
+  // Only ever shown inside the desktop shell — never in a plain browser tab.
+  if (!isElectronShell()) return null;
+  // Once we've loaded and the page isn't a connected server (no status), hide.
+  if (loaded && !host) return null;
+
+  // Render immediately (don't wait for the first status query, which shells out
+  // to a Python CLI): a neutral "checking…" row until the status arrives.
+  const hostDisp: Display = host
+    ? hostDisplay(host, pendingHost)
+    : { tone: "bg-muted-foreground/40", hint: "checking…", statusText: "Checking…", active: false };
 
   const runHost = async (action: HostControlAction) => {
     setPendingHost(action);
@@ -238,8 +250,8 @@ export function HostStatusIndicator() {
     <div className="max-md:hidden">
       <StatusMenu
         title="Host Status"
-        display={hostDisplay(host, pendingHost)}
-        canControl={host.cliInstalled}
+        display={hostDisp}
+        canControl={host ? host.cliInstalled : false}
         busy={pendingHost !== null}
         onAction={(action) => void runHost(action)}
       />
