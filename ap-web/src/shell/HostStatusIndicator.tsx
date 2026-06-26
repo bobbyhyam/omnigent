@@ -87,31 +87,43 @@ function StatusMenu({
         <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
           {statusText}
         </DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          className="gap-2"
-          disabled={busy || !canControl || active}
-          onSelect={() => onAction("start")}
-        >
-          <PlayIcon className="size-4 shrink-0" />
-          Start
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          className="gap-2"
-          disabled={busy || !canControl || !active}
-          onSelect={() => onAction("stop")}
-        >
-          <SquareIcon className="size-4 shrink-0" />
-          Stop
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          className="gap-2"
-          disabled={busy || !canControl || !active}
-          onSelect={() => onAction("restart")}
-        >
-          <RotateCwIcon className="size-4 shrink-0" />
-          Restart
-        </DropdownMenuItem>
+        {/* Actions depend on state: only Start when off, only Stop/Restart
+            when running. Nothing actionable when the CLI is missing. */}
+        {canControl && (
+          <>
+            <DropdownMenuSeparator />
+            {!active && (
+              <DropdownMenuItem
+                className="gap-2"
+                disabled={busy}
+                onSelect={() => onAction("start")}
+              >
+                <PlayIcon className="size-4 shrink-0" />
+                Start
+              </DropdownMenuItem>
+            )}
+            {active && (
+              <>
+                <DropdownMenuItem
+                  className="gap-2"
+                  disabled={busy}
+                  onSelect={() => onAction("stop")}
+                >
+                  <SquareIcon className="size-4 shrink-0" />
+                  Stop
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="gap-2"
+                  disabled={busy}
+                  onSelect={() => onAction("restart")}
+                >
+                  <RotateCwIcon className="size-4 shrink-0" />
+                  Restart
+                </DropdownMenuItem>
+              </>
+            )}
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
