@@ -27,8 +27,10 @@
 # the trusted DEFAULT branch and read the PR diff via the API; PR-authored code is
 # never executed. The drafter is unsandboxed like the examples/polly CI reviewer,
 # but only runs on already-merged PRs, the write-token is minted after it finishes
-# (never in its reach), and both its output and the drafted files are scanned for
-# the LLM key before any push.
+# (never in its reach), and the agents are fed only the code diff (never the PR
+# title/description) to shrink the injection surface. The output/drafted-file
+# secret-scans catch a key written to stdout or a file — they do NOT cover network
+# exfiltration; see the residual-risk note in .github/agents/doc-drafter/config.yaml.
 name: Doc sync
 
 on:
@@ -248,16 +250,17 @@ jobs:
                         "If the visible portion is inconclusive, lean toward needs-doc-update.\n" if truncated else "")
           files = "\n".join(f"- {f['path']} (+{f['additions']}/-{f['deletions']})"
                             for f in meta.get("files", [])[:200])
-          body = (meta.get("body") or "")[:4000]
+          # Deliberately NOT including the PR title or description: they are
+          # free-form, author-controlled prose (a prompt-injection surface) and add
+          # little over the code itself. Classify from the actual change — the
+          # changed-file list and the diff.
           prompt = f"""A pull request just merged. Classify its documentation impact per your instructions.
+          Judge ONLY from the changed files and diff below — there is no PR title or
+          description, by design; reason about what the code actually changed.
 
-          ## PR
-          - Title: {meta['title']}
-          - Stats: +{meta['additions']}/-{meta['deletions']} across {meta['changedFiles']} file(s)
+          ## Stats
+          +{meta['additions']}/-{meta['deletions']} across {meta['changedFiles']} file(s)
           {trunc_note}
-          ## Description
-          {body if body else '(no description)'}
-
           ## Changed files
           {files if files else '(none reported)'}
 
@@ -394,30 +397,31 @@ jobs:
         run: |
           set -euo pipefail
           python3 -u <<'PYEOF'
-          import json, os, pathlib, shutil
+          import os, pathlib
           ws = os.environ["GITHUB_WORKSPACE"]
-          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           truncated = pathlib.Path("/tmp/diff_truncated").read_text().strip() == "true"
           trunc_note = ("\n> NOTE: the diff was truncated at 512 KB — document only what the visible "
                         "portion supports and flag the rest for manual review.\n" if truncated else "")
-          body = (meta.get("body") or "")[:4000]
           # Hand the FULL diff to the drafter via a file in its cwd, not inline in
           # the prompt: a large diff (PR #881 was 162 KB) would exceed Linux's
           # ~128 KiB single-argv limit (MAX_ARG_STRLEN) and `omnigent run -p`
           # couldn't even execve. The drafter reads DIFF_FILE with sys_os_read.
-          shutil.copyfile("/tmp/pr_diff.txt", pathlib.Path(ws) / "_pr_diff.txt")
+          # Re-encode through UTF-8 (errors="replace") so a byte-cap that split a
+          # multibyte codepoint can't leave an invalid tail that sys_os_read chokes on.
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          (pathlib.Path(ws) / "_pr_diff.txt").write_text(diff, encoding="utf-8")
+          # Deliberately NO PR title or description: those are free-form,
+          # author-controlled prose (a prompt-injection surface). The drafter works
+          # from the code change in DIFF_FILE.
           prompt = f"""SITE_REPO={ws}/omnigent-site
           PR_NUMBER={os.environ['PR_NUMBER']}
-          PR_TITLE={meta['title']}
           DIFF_FILE=./_pr_diff.txt
 
-          Read DIFF_FILE first — it holds the merged PR's full diff and is your
-          source of truth. Then draft the omnigent-site docs update per your
-          instructions and print the DOC_DRAFT_SUMMARY block.
-          {trunc_note}
-          ## Description
-          {body if body else '(no description)'}
-          """
+          Read DIFF_FILE first — it holds the merged PR's full diff and is your only
+          source of truth (there is no PR title or description, by design). Then
+          draft the omnigent-site docs update per your instructions and print the
+          DOC_DRAFT_SUMMARY block.
+          {trunc_note}"""
           pathlib.Path("/tmp/draft_prompt.txt").write_text(prompt)
           PYEOF
 
@@ -558,16 +562,23 @@ jobs:
           # omnigent-site is public.
           PUSH_URL="https://x-access-token:${SITE_TOKEN}@github.com/${SITE_REPO_SLUG}.git"
 
-          # Don't clobber human edits: if the rolling branch already exists with a
-          # HEAD commit by someone other than the bot, leave it as-is.
+          # Don't clobber human edits: if the rolling branch already exists, only
+          # force-push when we can POSITIVELY confirm its HEAD is the bot's. This
+          # guard fails CLOSED — if the branch exists but we can't read its HEAD
+          # author (fetch failed, FETCH_HEAD absent), we skip rather than risk
+          # force-pushing over human commits.
+          BOT_EMAIL="294685417+omnigent-ci[bot]@users.noreply.github.com"
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            git fetch --depth=1 origin "$BRANCH" >/dev/null 2>&1 || true
+            if ! git fetch --depth=1 origin "$BRANCH" >/dev/null 2>&1; then
+              echo "::warning::$BRANCH exists but could not be fetched — skipping (fail-closed, won't risk clobbering)."
+              exit 0
+            fi
             LAST_AUTHOR="$(git log -1 --format='%ae' FETCH_HEAD 2>/dev/null || echo '')"
-            if [ -n "$LAST_AUTHOR" ] && [ "$LAST_AUTHOR" != "294685417+omnigent-ci[bot]@users.noreply.github.com" ]; then
-              echo "::warning::$BRANCH has manual commits ($LAST_AUTHOR) — skipping auto-redraft."
+            if [ "$LAST_AUTHOR" != "$BOT_EMAIL" ]; then
+              echo "::warning::$BRANCH HEAD author is '${LAST_AUTHOR:-<unreadable>}' (not the bot) — skipping auto-redraft."
               SITE_PR="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
               [ -n "$SITE_PR" ] && gh pr comment "$SITE_PR" --repo "$SITE_REPO_SLUG" \
-                --body "doc-sync: detected manual edits on this branch — skipping the automated re-draft for ${CODE_REPO}#${PR_NUMBER}." || true
+                --body "doc-sync: this branch's HEAD isn't the automated bot commit — skipping the automated re-draft for ${CODE_REPO}#${PR_NUMBER} to avoid overwriting manual edits." || true
               exit 0
             fi
           fi
@@ -606,6 +617,31 @@ jobs:
           echo "(OMNIGENT_BOT_APP_ID/KEY missing, or the omnigent-ci App lost access to omnigent-site). The PR was not opened."
           echo "### Doc-sync: drafted but not pushed" >> "$GITHUB_STEP_SUMMARY"
           { echo '```diff'; (cd omnigent-site && git --no-pager diff); echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+
+      # ::add-mask:: only redacts rendered logs, not artifact file contents — and
+      # the stderr logs are uploaded but never secret-scanned mid-pipeline. Redact
+      # the literal key from every artifact file before upload so an error dump
+      # that echoed the key into stderr can't leave the runner unredacted.
+      - name: Redact secrets from artifacts
+        if: always() && steps.plan.outputs.proceed == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${LLM_API_KEY:-}" ] || exit 0
+          python3 - <<'PYEOF'
+          import os, pathlib
+          key = os.environ.get("LLM_API_KEY", "")
+          for f in ["classify-stderr.log", "draft-stderr.log",
+                    "/tmp/classify_out.txt", "/tmp/draft_out.txt", "/tmp/site_pr_body.md"]:
+              p = pathlib.Path(f)
+              if not p.is_file() or not key:
+                  continue
+              t = p.read_text(encoding="utf-8", errors="replace")
+              if key in t:
+                  p.write_text(t.replace(key, "***REDACTED***"), encoding="utf-8")
+                  print(f"redacted key from {f}")
+          PYEOF
 
       - name: Upload logs on failure
         if: always() && steps.plan.outputs.proceed == 'true'
