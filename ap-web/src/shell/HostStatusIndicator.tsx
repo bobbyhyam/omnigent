@@ -122,8 +122,13 @@ function StatusMenu({
       >
         <span className="truncate">{title}</span>
         <span className="ml-auto flex items-center gap-1.5">
-          {display.hint && <span className="text-xs leading-none">{display.hint}</span>}
-          <span aria-hidden className={cn("size-2 shrink-0 rounded-full", display.tone)} />
+          {display.hint && <span className="text-xs">{display.hint}</span>}
+          {/* relative top-px: nudge the dot onto the text's optical center
+              (lowercase text sits below the line-box center items-center uses). */}
+          <span
+            aria-hidden
+            className={cn("relative top-px size-2 shrink-0 rounded-full", display.tone)}
+          />
         </span>
       </DropdownMenuTrigger>
       <DropdownMenuContent side="top" align="start" className="min-w-48">
