@@ -126,6 +126,8 @@ interface ElectronDesktopApi extends NativeShellApi {
    * not from inside the SPA.
    */
   getHostStatus?: () => Promise<HostStatus | null>;
+  /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
+  getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Local-server status for the window's server (loopback only), or null. */
   getServerStatus?: () => Promise<LocalServerStatus | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -159,6 +161,14 @@ export interface HostStatus {
   ownedByDesktop: boolean;
   /** A status error from the CLI, or null. */
   error: string | null;
+}
+
+/** This machine's identity, read from local config (fast — no subprocess). */
+export interface HostIdentity {
+  /** Whether the `omnigent` CLI was found and is runnable. */
+  cliInstalled: boolean;
+  /** This machine's host id, or null if it has none yet. */
+  hostId: string | null;
 }
 
 /** Local-server status for a loopback server, from the desktop shell. */
@@ -485,6 +495,23 @@ export async function getHostStatus(): Promise<HostStatus | null> {
     return await electron.getHostStatus();
   } catch (err) {
     console.warn("[nativeBridge] electron getHostStatus failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Fetch this machine's identity (CLI installed + host id) from the desktop
+ * shell. Fast — reads local config, no runner-status subprocess — so callers
+ * that only need to recognize "this machine" (e.g. the host picker) don't wait
+ * on the slow status check. Resolves `null` outside the Electron shell.
+ */
+export async function getHostIdentity(): Promise<HostIdentity | null> {
+  const electron = electronApi();
+  if (!electron?.getHostIdentity) return null;
+  try {
+    return await electron.getHostIdentity();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getHostIdentity failed:", err);
     return null;
   }
 }

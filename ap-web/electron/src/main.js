@@ -1890,6 +1890,18 @@ function registerIpc() {
     return serverManager.startLocalServer(cliPath);
   });
 
+  // SPA → this machine's identity: is the CLI installed, and its host id. Both
+  // come from local config (no `omnigent host status` subprocess), so this is
+  // instant — it lets the new-session picker tag/connect "this machine" without
+  // waiting on the slow runner-status check.
+  ipcMain.handle("omnigent:host-get-identity", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] host-get-identity from untrusted sender dropped");
+      return null;
+    }
+    return { cliInstalled: Boolean(resolvedCliPath()), hostId: omnigentCli.localHostId() };
+  });
+
   // SPA → this machine's host-connection status for the window's own server
   // (read-only; drives the sidebar host indicator).
   ipcMain.handle("omnigent:host-get-status", async (event) => {

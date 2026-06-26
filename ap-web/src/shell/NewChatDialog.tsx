@@ -54,10 +54,10 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
-  getHostStatus,
+  getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
-  type HostStatus,
+  type HostIdentity,
 } from "@/lib/nativeBridge";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -958,7 +958,7 @@ export function NewChatLandingScreen() {
   const [sandboxSelected, setSandboxSelected] = useState(false);
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
-  const [desktopHost, setDesktopHost] = useState<HostStatus | null>(null);
+  const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   // Defer the connect until the dropdown has actually closed (set on select,
   // consumed in the menu's onOpenChange) — connecting while the menu is open
@@ -1021,7 +1021,7 @@ export function NewChatLandingScreen() {
     if (!isElectronShell()) return;
     let cancelled = false;
     const refresh = () => {
-      void getHostStatus().then((s) => {
+      void getHostIdentity().then((s) => {
         if (!cancelled) setDesktopHost(s);
       });
     };
@@ -1381,10 +1381,10 @@ export function NewChatLandingScreen() {
     try {
       const res = await controlHost("start");
       if (!res.ok) return;
-      const status = await getHostStatus();
-      setDesktopHost(status);
+      const identity = await getHostIdentity();
+      setDesktopHost(identity);
       await queryClient.invalidateQueries({ queryKey: ["hosts"] });
-      if (status?.hostId) selectHost(status.hostId);
+      if (identity?.hostId) selectHost(identity.hostId);
     } finally {
       setConnectingThisMachine(false);
     }

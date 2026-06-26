@@ -75,6 +75,12 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   getHostStatus: () => ipcRenderer.invoke("omnigent:host-get-status"),
   /**
+   * This machine's identity — `{ cliInstalled, hostId }` — read from local
+   * config with no subprocess, so it's instant (unlike getHostStatus, which
+   * also runs the slow runner-status check).
+   */
+  getHostIdentity: () => ipcRenderer.invoke("omnigent:host-get-identity"),
+  /**
    * Local-server status for the window's server (loopback only); resolves null
    * for remote servers.
    */
