@@ -74,21 +74,33 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # normal approval/sandbox stance. See issue #657.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
-# Labels scoped to one running session instance — deliberately NOT copied
-# when forking. A fork is an independent session that re-binds its own
-# runtime, so inheriting these would point the clone at the SOURCE's
-# state: the native bridge-id labels would route the clone's terminal +
-# web injection to the source's claude/codex bridge (whose active-session
-# marker isn't the clone → "session no longer active"); the context-size
-# metrics would display the source's last usage. The literals mirror the
-# harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
-# cross-checks them so a rename in those modules fails loudly here.
+# Labels that must NOT cross into a new session context — deliberately
+# dropped both when forking (not copied to the clone) and on an in-place
+# agent switch (deleted from the switched session). Two distinct reasons
+# put a key here:
+#
+#   * Runtime state bound to ONE running instance — the native bridge-id
+#     labels would route the new context's terminal + web injection to the
+#     SOURCE's claude/codex bridge (whose active-session marker isn't the
+#     clone → "session no longer active"); the context-size metrics would
+#     display the source's last usage. The bridge-id literals mirror the
+#     harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
+#     cross-checks them so a rename in those modules fails loudly here.
+#
+#   * Per-context safety opt-in — the DANGEROUS codex full-bypass directive
+#     (:data:`CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY`). Letting it ride into a
+#     fork (a new session + workspace) or survive an agent switch would
+#     silently re-arm ``--dangerously-bypass-approvals-and-sandbox`` with no
+#     typed re-confirmation and no banner, violating the "impossible to
+#     enable accidentally" contract (#657). Dropping it forces each session
+#     that runs bypass to make its own explicit opt-in.
 _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
 

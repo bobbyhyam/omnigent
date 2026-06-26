@@ -1095,6 +1095,16 @@ export function NewChatLandingScreen() {
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  // Defense in depth for the DANGEROUS bypass toggle: never let an armed
+  // bypass carry across an agent change. Switching the picker to another
+  // agent — or away from Codex and back — must require the typed confirmation
+  // again, the same per-context re-opt-in the store enforces for fork /
+  // agent-switch (CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY is instance-scoped).
+  // Keyed on the effective agent id so it also fires when a persisted pick
+  // resolves to a different agent on mount.
+  useEffect(() => {
+    setBypassSandbox(false);
+  }, [effectiveAgentId]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.

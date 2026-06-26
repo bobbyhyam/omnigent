@@ -674,6 +674,16 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
         # ``--flag=value`` single token: dropped whole, consumes nothing after.
         (("--ask-for-approval=on-failure",), []),
         (("--sandbox=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short aliases: ``-a`` (== --ask-for-approval) triggers the SAME codex
+        # startup abort as the long form, so it must be stripped too; ``-s``
+        # (== --sandbox) is harmless but dropped for consistency. Both spellings
+        # (space-separated and ``=value``-joined) are handled.
+        (("-a", "never"), []),
+        (("-a=never",), []),
+        (("-s", "read-only"), []),
+        (("-s=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short alias option-adjacent to another flag: the next flag survives.
+        (("-a", "--model", "gpt"), ["--model", "gpt"]),
         # Trailing flag at end-of-list: dropped cleanly, no value to consume.
         (("--model", "gpt", "--sandbox"), ["--model", "gpt"]),
         # Unrelated arg next to a stripped pair is preserved.

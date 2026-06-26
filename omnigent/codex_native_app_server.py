@@ -1529,26 +1529,35 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 
 
 # Codex's full-bypass flag. Disables BOTH the approval prompts and the
-# command sandbox in one switch. It is mutually exclusive with the
-# granular ``--sandbox`` / ``--ask-for-approval`` flags: codex aborts at
-# startup if the bypass flag is combined with either, so when bypass is on
-# the conflicting flags must be stripped from the pass-through args. See
-# issue #657.
+# command sandbox in one switch. Verified against codex-cli 0.140.0-alpha.2:
+# it is mutually exclusive with the approval flag only — passing
+# ``--ask-for-approval`` (or its ``-a`` alias, in any spelling) alongside it
+# aborts at startup with "cannot be used with
+# --dangerously-bypass-approvals-and-sandbox". ``--sandbox`` / ``-s`` do NOT
+# conflict (the bypass already implies ``danger-full-access``), so leaving
+# them in is harmless. We strip BOTH anyway when bypass is on — the approval
+# flag because it MUST go, the sandbox flag for hygiene so the launched arg
+# list reflects a single coherent stance. See issue #657.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
-# Granular approval/sandbox flags (the "Full access" / "Read only" approval
-# presets emit these as ``--flag value`` pairs — see ap-web
-# CODEX_NATIVE_APPROVAL_MODES) that conflict with the bypass flag and must
-# be dropped, together with their following value, when bypass is enabled.
-_CODEX_APPROVAL_SANDBOX_FLAGS = frozenset({"--sandbox", "--ask-for-approval"})
+# Granular approval/sandbox flags to drop when bypass is on. The "Full
+# access" / "Read only" approval presets emit the long ``--flag value`` form
+# (see ap-web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
+# client-supplied (validated only for count/length), so the short aliases
+# (``-a`` / ``-s``) are included too: ``-a`` triggers the same startup abort
+# as ``--ask-for-approval`` and must never reach codex. Each is matched in
+# both the space-separated (``-a never``) and joined (``-a=never``) spellings
+# by :func:`_strip_approval_sandbox_flags`.
+_CODEX_APPROVAL_SANDBOX_FLAGS = frozenset({"--sandbox", "-s", "--ask-for-approval", "-a"})
 
 
 def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     """
-    Drop granular ``--sandbox`` / ``--ask-for-approval`` flags (and values).
+    Drop granular approval/sandbox flags (and values) when bypass is on.
 
-    Used when the full-bypass flag is enabled: codex rejects the bypass
-    flag when it is combined with either granular flag, so each such flag
-    is removed. Both CLI spellings are handled:
+    Removes every flag in :data:`_CODEX_APPROVAL_SANDBOX_FLAGS` —
+    ``--ask-for-approval`` / ``-a`` (which codex *rejects* alongside the
+    bypass flag) and ``--sandbox`` / ``-s`` (harmless, dropped for hygiene).
+    Both CLI spellings of each are handled:
 
     - ``--sandbox=read-only`` (single ``--flag=value`` token) is dropped
       whole.

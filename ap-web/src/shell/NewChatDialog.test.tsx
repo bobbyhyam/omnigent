@@ -806,6 +806,40 @@ describe("NewChatLandingScreen", () => {
     expect(banner.textContent).toContain("approvals and the sandbox disabled");
   });
 
+  it("disarms the dangerous bypass when the agent changes (re-confirm per context)", () => {
+    renderLanding();
+    // Arm bypass on Codex (a2): type the phrase, flip the switch, close tray.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+      target: { value: "bypass sandbox" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    // Armed → the persistent banner is up under the composer.
+    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
+
+    // Switch away to Claude (a1): the armed bypass must clear immediately, so
+    // the persistent banner disappears (Claude has no bypass toggle at all).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
+
+    // Switch back to Codex and reopen Advanced: the toggle is OFF and disabled
+    // again — the confirmation phrase must be re-typed for this fresh context.
+    // Without the reset effect it would re-render armed from stale state.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    const toggle = screen.getByTestId(
+      "new-chat-landing-bypass-sandbox-switch",
+    ) as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(toggle.disabled).toBe(true);
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
+  });
+
   it("seeds the bypass-sandbox label in the create body when armed", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
