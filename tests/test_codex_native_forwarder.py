@@ -16,6 +16,7 @@ only an already-mirrored value is not re-posted.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -27,6 +28,7 @@ from omnigent.codex_native_bridge import (
     read_bridge_state,
     write_bridge_state,
 )
+from omnigent.codex_native_forwarder import _persist_codex_compaction_item
 
 
 class _RecordingClient:
@@ -803,6 +805,11 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({"codexErrorInfo": "Unauthorized"}, "nope") == auth
     assert fwd._classify_codex_error({"codexErrorInfo": {"type": "Unauthorized"}}, "nope") == auth
     assert fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 401}}, "nope") == auth
+    # The real app-server enum serializes lowercase snake_case; it must match
+    # via the structured path (message "nope" has no auth substring to fall
+    # back on), case-insensitively.
+    assert fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "unauthorized"}}, "nope") == auth
     # Message-text fallback when codexErrorInfo is absent.
     assert fwd._classify_codex_error({}, "Please run codex login") == auth
     assert fwd._classify_codex_error({}, "ChatGPT session expired") == auth
@@ -1294,3 +1301,57 @@ async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
 
     assert len(client.posts) == 1
     assert client.posts[0][1]["data"] == {"delta": "", "started": True}
+
+
+# ---------------------------------------------------------------------------
+# _persist_codex_compaction_item
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_posts_event() -> None:
+    """Compaction event is posted with last_item_id and Codex summary."""
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
+    get_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_codex"
+    assert "Codex" in body["data"]["summary"]
+    # Codex can't read post-compaction state, so no compacted_messages
+    assert "compacted_messages" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
+    """When no items exist, last_item_id falls back to compact_boundary_ prefix."""
+    empty_resp = MagicMock()
+    empty_resp.json.return_value = {"data": []}
+    empty_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=empty_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["data"]["last_item_id"].startswith("compact_boundary_")
+    assert "compacted_messages" not in body["data"]

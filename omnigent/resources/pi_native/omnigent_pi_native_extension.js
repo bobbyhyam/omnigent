@@ -57,6 +57,257 @@ async function evalNativePolicyHttp(config, toolName, args) {
   }
 }
 
+/**
+ * Build a Pi tool-result object from an MCP ``tools/call`` JSON-RPC response.
+ *
+ * Pi expects ``{ content: [{ type: "text", text }], isError }``. The Omnigent
+ * MCP proxy returns a JSON-RPC envelope whose ``result`` carries an MCP
+ * content array (``[{ type: "text", text }]``) on success, or a JSON-RPC
+ * ``error`` object (with the MCP convention code -32000 for tool denials /
+ * tool errors) on failure. Map both into a single text block so the Pi agent
+ * can read the output — denials surface as a readable error rather than
+ * wedging the loop.
+ */
+function piResultFromMcpResponse(json) {
+  if (json && typeof json === "object" && json.error) {
+    const msg =
+      (json.error && json.error.message) || "Omnigent tool call failed";
+    return { content: [{ type: "text", text: String(msg) }], isError: true };
+  }
+  const result = json && typeof json === "object" ? json.result : undefined;
+  // An ``input_required`` envelope must never reach this mapper: it carries no
+  // ``content`` array, so it would otherwise fall to the "unexpected shape"
+  // branch and be returned as ``isError: false`` — a confusing elicitation blob
+  // masquerading as a successful tool result. callOmnigentTool detects and
+  // resolves the ASK round-trip BEFORE calling this; treat a stray one as a
+  // fail-closed error so an unresolved approval never reports success.
+  if (result && typeof result === "object" && result.resultType === "input_required") {
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call requires approval that was not resolved",
+        },
+      ],
+      isError: true,
+    };
+  }
+  if (result && Array.isArray(result.content)) {
+    const parts = [];
+    for (const block of result.content) {
+      if (block && typeof block === "object" && typeof block.text === "string") {
+        parts.push(block.text);
+      }
+    }
+    const text = parts.join("\n");
+    return {
+      content: [{ type: "text", text: text || safeJsonStringify(result) }],
+      isError: result.isError === true,
+    };
+  }
+  // Unexpected shape: hand the raw result back so nothing is silently dropped.
+  return {
+    content: [{ type: "text", text: safeJsonStringify(result ?? json ?? {}) }],
+    isError: false,
+  };
+}
+
+/**
+ * Extract the elicitation id + opaque requestState from an MCP
+ * ``input_required`` (MRTR) envelope, or ``null`` when the response is not an
+ * ``input_required`` result.
+ *
+ * The Omnigent server keys ``inputRequests`` by the server-minted elicitation
+ * id (the MRTR spec lets the client read those keys; only ``requestState`` is
+ * opaque), so the first key is the id the retry must echo back inside
+ * ``inputResponses``.
+ */
+function mcpInputRequired(json) {
+  const result = json && typeof json === "object" ? json.result : undefined;
+  if (!result || typeof result !== "object" || result.resultType !== "input_required") {
+    return null;
+  }
+  const inputRequests =
+    result.inputRequests && typeof result.inputRequests === "object"
+      ? result.inputRequests
+      : {};
+  const elicitationId = Object.keys(inputRequests)[0] || "";
+  const requestState =
+    typeof result.requestState === "string" ? result.requestState : "";
+  return { elicitationId, requestState };
+}
+
+/**
+ * POST a single JSON-RPC ``tools/call`` to the server's per-session MCP proxy
+ * and return the parsed response (or a fail-closed Pi tool-result on a
+ * transport/HTTP error). ``extraParams`` carries the MRTR retry fields
+ * (``requestState`` + ``inputResponses``) on the approval retry; it is omitted
+ * on the initial call.
+ *
+ * @returns {Promise<{json: object} | {piResult: object}>} ``json`` on a parsed
+ *   200 response; ``piResult`` is a terminal fail-closed tool result the caller
+ *   returns as-is.
+ */
+async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`;
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: rpcId,
+    method: "tools/call",
+    params: { name: toolName, arguments: args || {}, ...(extraParams || {}) },
+  });
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(config.authHeaders || {}),
+      },
+      body,
+    });
+    if (!resp.ok) {
+      return {
+        piResult: {
+          content: [
+            {
+              type: "text",
+              text: `Omnigent tool call failed: HTTP ${resp.status}`,
+            },
+          ],
+          isError: true,
+        },
+      };
+    }
+    return { json: await resp.json() };
+  } catch (err) {
+    return {
+      piResult: {
+        content: [
+          {
+            type: "text",
+            text: `Omnigent tool call failed: ${err && err.message ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      },
+    };
+  }
+}
+
+/**
+ * Execute an Omnigent tool by POSTing a JSON-RPC ``tools/call`` request to the
+ * server's per-session MCP proxy endpoint
+ * (``POST /v1/sessions/{sessionId}/mcp``).
+ *
+ * This is the SAME endpoint the runner's ``ProxyMcpManager`` uses: the Omnigent
+ * server evaluates TOOL_CALL / TOOL_RESULT policy and then forwards execution
+ * to the runner's ``/mcp/execute`` (which dispatches the real ``sys_*`` tool on
+ * the correct machine with the session's terminal/workspace). The extension
+ * already carries ``serverUrl`` + ``sessionId`` + ``authHeaders`` in its config,
+ * so no extra relay process is needed.
+ *
+ * **ASK policy / elicitation round-trip (MRTR).** When the tool is gated by an
+ * ASK policy the proxy returns HTTP 200 with an ``input_required`` result
+ * (``{resultType, inputRequests, requestState}``) instead of executing. We must
+ * NOT hand that envelope to the model as a result — it neither prompts nor runs
+ * the tool. Mirroring ``ProxyMcpManager.dispatch()``, we resolve the human
+ * verdict and retry once with the decision in ``inputResponses``:
+ *   1. Long-poll ``POST /policies/evaluate`` via ``evalNativePolicyHttp`` — the
+ *      SAME server-side ASK park the non-bridged hook uses. It holds the
+ *      connection until a human resolves the approval card and collapses to a
+ *      hard ALLOW / DENY (the extension has no in-process approval Future like
+ *      the runner, so the long-poll IS its park/resolve mechanism).
+ *   2. Retry the ``tools/call`` ONCE with ``requestState`` + ``inputResponses:
+ *      {elicitationId: {action: "accept" | "decline"}}``. The server re-evaluates
+ *      TOOL_CALL policy on the retry (it does not trust the client's claim
+ *      blindly), so a still-denied tool stays denied.
+ *   3. Cap at one retry; fail CLOSED (``isError: true``, readable message) if the
+ *      approval cannot be resolved or the proxy still asks after the retry.
+ *
+ * (Trade-off: the proxy's ASK already published one approval card, and the
+ * evaluate long-poll publishes a second one — the extension cannot re-attach to
+ * the proxy-minted elicitation, whose id is in a different namespace. The human
+ * resolves the evaluate card to drive the verdict; the proxy card is orphaned.
+ * This is a UX wrinkle, not a security gap: the tool only runs on a genuine
+ * human accept, and the server re-checks policy on the retry.)
+ *
+ * Fail-safe: any transport/parse error resolves to a readable tool-result error
+ * (``isError: true``) rather than throwing, so a server hiccup never wedges Pi's
+ * agent loop.
+ */
+async function callOmnigentTool(config, toolName, args) {
+  if (
+    !config ||
+    !config.serverUrl ||
+    !config.sessionId ||
+    typeof fetch !== "function"
+  ) {
+    return {
+      content: [
+        { type: "text", text: "Omnigent tool bridge is not configured" },
+      ],
+      isError: true,
+    };
+  }
+
+  const first = await postMcpToolsCall(config, toolName, args, 1);
+  if (first.piResult) return first.piResult;
+  const initial = mcpInputRequired(first.json);
+  if (initial === null) {
+    // ALLOW / DENY / executed — map directly to a Pi tool result.
+    return piResultFromMcpResponse(first.json);
+  }
+
+  // ── ASK: resolve the human verdict, then retry once (MRTR) ──────────
+  if (!initial.elicitationId || !initial.requestState) {
+    // Malformed input_required — cannot retry. Fail CLOSED.
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call requires approval but the server sent no resolvable elicitation",
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  const verdict = await evalNativePolicyHttp(config, toolName, args || {});
+  if (verdict === null) {
+    // The approval gate is structurally unavailable (no server/session/fetch,
+    // or a transport error) — fail CLOSED rather than report false success.
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call requires approval but the policy server was unreachable",
+        },
+      ],
+      isError: true,
+    };
+  }
+  const action = verdict.block ? "decline" : "accept";
+
+  const retry = await postMcpToolsCall(config, toolName, args, 2, {
+    requestState: initial.requestState,
+    inputResponses: { [initial.elicitationId]: { action } },
+  });
+  if (retry.piResult) return retry.piResult;
+  if (mcpInputRequired(retry.json) !== null) {
+    // The proxy asked again after one approval round — do NOT loop. Fail CLOSED.
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call still requires approval after one round — not retrying",
+        },
+      ],
+      isError: true,
+    };
+  }
+  return piResultFromMcpResponse(retry.json);
+}
+
 function textFromContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -123,6 +374,51 @@ function fingerprint(text) {
 function messageRole(message) {
   if (!message || typeof message !== "object") return "";
   return String(message.role || message.type || "");
+}
+
+function toInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+/**
+ * Lift token usage out of one Pi assistant message.
+ *
+ * Mirrors the non-native executor's ``_extract_pi_turn_usage``
+ * (omnigent/inner/pi_executor.py): Pi (``@earendil-works/pi-coding-agent``)
+ * carries a per-message ``usage`` object with ``input`` / ``output`` /
+ * ``cacheRead`` / ``cacheWrite`` / ``totalTokens`` counts, and the message
+ * carries the resolved ``model``. Pi's ``input`` is the NON-cached input
+ * (Anthropic semantics) — ``cacheRead`` / ``cacheWrite`` are separate, so the
+ * full input a turn sent is ``input + cacheRead + cacheWrite``.
+ *
+ * @returns {{input:number,output:number,cacheRead:number,cacheWrite:number,
+ *   total:number,model:(string|null)}|null} the per-message counts, or
+ *   ``null`` when ``message`` is not an assistant message carrying usage.
+ */
+function extractPiUsage(message) {
+  if (!message || typeof message !== "object") return null;
+  if (message.role !== "assistant") return null;
+  const usage = message.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const input = toInt(usage.input);
+  const output = toInt(usage.output);
+  const cacheRead = toInt(usage.cacheRead);
+  const cacheWrite = toInt(usage.cacheWrite);
+  // No countable tokens means Pi emitted an empty usage object — treat as "no
+  // usage" so the server leaves the session unpriced rather than recording a
+  // $0.00 turn (matches _aggregate_pi_turn_usage's empty-usage guard).
+  if (!(input || output || cacheRead || cacheWrite)) return null;
+  const rawModel = message.model;
+  const model = typeof rawModel === "string" && rawModel ? rawModel : null;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    total: toInt(usage.totalTokens),
+    model,
+  };
 }
 
 function headers(config) {
@@ -355,6 +651,125 @@ module.exports = function (pi) {
   // so a duplicate text_end (or a stray text_delta after end) can't reopen
   // or double-finalize the preview.
   const finalizedTextBlocks = new Set();
+
+  // Names of the Omnigent tools registered via pi.registerTool below. Bridged
+  // tools are policy-evaluated server-side inside the /mcp proxy (TOOL_CALL +
+  // TOOL_RESULT), so the tool_call hook must NOT also call
+  // evalNativePolicyHttp for them — that would double-evaluate and, for ASK
+  // policies, double-prompt. Pi's OWN built-in tools (read/shell/etc) are not
+  // in this set and stay gated by the hook below.
+  const bridgedTools = new Set();
+  if (config && Array.isArray(config.tools)) {
+    for (const tool of config.tools) {
+      if (!tool || typeof tool !== "object") continue;
+      const name = typeof tool.name === "string" ? tool.name : "";
+      if (!name) continue;
+      bridgedTools.add(name);
+      const description =
+        typeof tool.description === "string" ? tool.description : "";
+      const parameters =
+        tool.parameters && typeof tool.parameters === "object"
+          ? tool.parameters
+          : { type: "object", properties: {} };
+      // Pi passes tool.parameters straight to the LLM as JSON Schema, so the
+      // Omnigent schema is usable as-is. execute() round-trips the call to the
+      // Omnigent server's MCP proxy and returns the result to Pi.
+      if (typeof pi.registerTool === "function") {
+        pi.registerTool({
+          name,
+          label: name,
+          description,
+          promptSnippet: description ? description.slice(0, 120) : name,
+          parameters,
+          async execute(_toolCallId, params) {
+            return callOmnigentTool(config, name, params || {});
+          },
+        });
+      }
+    }
+  }
+
+  // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
+  // assistant message per LLM call); session billing is their SUM — each call
+  // is billed for the full context it re-sent, so summing per-message inputs is
+  // the correct cumulative input. The server applies vendor pricing to these
+  // cumulative totals and republishes a ``session.usage`` event (the SAME
+  // contract claude-native / codex-native / cursor-native use), so the web
+  // Session-cost badge + per-model token breakdown light up with no
+  // server/frontend changes. Dedup by message fingerprint so a re-emitted
+  // ``message_end`` / ``turn_end`` / ``agent_end`` carrying the same assistant
+  // message never double-counts. ``usageModel`` tracks the latest message's
+  // model (mirrors a mid-session model switch). ``lastPostedUsageKey`` dedups
+  // the POST itself so a flush with no new tokens is skipped.
+  const countedUsageMessages = new Set();
+  let cumulativeInputTokens = 0;
+  let cumulativeOutputTokens = 0;
+  let cumulativeCacheReadTokens = 0;
+  let usageModel = null;
+  let lastPostedUsageKey = "";
+
+  // Build a stable fingerprint for one assistant message so the same message
+  // arriving on multiple lifecycle events is only counted once. Pi's
+  // ``AssistantMessage`` (``@earendil-works/pi-ai``) carries NO ``id`` field
+  // but DOES carry an optional provider ``responseId`` and a required numeric
+  // ``timestamp`` — both stable across the same message's re-emission on
+  // ``message_end`` / ``turn_end`` / ``agent_end``. Prefer those identity
+  // fields (plus a forward-compat ``id``) over the usage-count fingerprint:
+  // hashing counts alone collides two DISTINCT LLM calls that happen to report
+  // identical token counts (e.g. two identical short acks under prompt
+  // caching), which would silently drop the second call's tokens (undercount).
+  // The usage-count fingerprint stays only as a last resort for a message that
+  // carries no identity field at all.
+  function usageMessageKey(message, usage) {
+    if (message && typeof message === "object") {
+      if (typeof message.id === "string" && message.id) return `id:${message.id}`;
+      if (typeof message.responseId === "string" && message.responseId)
+        return `rid:${message.responseId}`;
+      if (typeof message.timestamp === "number")
+        return `ts:${message.timestamp}`;
+    }
+    return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
+  }
+
+  // Fold one assistant message's usage into the cumulative session totals,
+  // deduped by fingerprint. Returns true when it counted (totals advanced).
+  function accumulateUsage(message) {
+    const usage = extractPiUsage(message);
+    if (!usage) return false;
+    const key = usageMessageKey(message, usage);
+    if (countedUsageMessages.has(key)) return false;
+    countedUsageMessages.add(key);
+    // The server's ``cumulative_input_tokens`` is INCLUSIVE of cache reads (it
+    // splits the cache portion back out and prices it at the cache-read rate),
+    // so add cacheRead into the input total. ``cacheWrite`` (cache creation)
+    // has no dedicated cumulative field on the server, so fold it into the
+    // input total too — it is then priced at the input rate rather than the
+    // ~1.25x cache-write rate, a small, documented approximation that never
+    // drops the tokens.
+    cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
+    cumulativeOutputTokens += usage.output;
+    cumulativeCacheReadTokens += usage.cacheRead;
+    if (usage.model) usageModel = usage.model;
+    return true;
+  }
+
+  // POST the cumulative session usage so the server prices it and publishes a
+  // ``session.usage`` event. Cumulative (SET) semantics — the server overwrites
+  // its stored totals each flush. Deduped so a flush with no advance is a
+  // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
+  async function postSessionUsage() {
+    if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
+    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    if (postKey === lastPostedUsageKey) return;
+    lastPostedUsageKey = postKey;
+    const data = {
+      cumulative_input_tokens: cumulativeInputTokens,
+      cumulative_output_tokens: cumulativeOutputTokens,
+      cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+    };
+    if (usageModel) data.model = usageModel;
+    await postEvent(config, { type: "external_session_usage", data });
+  }
 
   function rememberContext(ctx) {
     if (ctx) latestContext = ctx;
@@ -609,12 +1024,24 @@ module.exports = function (pi) {
     });
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     rememberContext(ctx);
     clearPendingInterrupt();
     agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
     activeResponseId = null;
+    // Last-chance usage capture from the agent loop's final message set, in
+    // case neither ``message_end`` nor ``turn_end`` carried usage for some
+    // call. ``event.messages`` may hold the whole conversation; the
+    // fingerprint dedup means re-scanning already-counted messages is a no-op,
+    // so a plain forward-scan is safe (no overcount).
+    const messages =
+      event && Array.isArray(event.messages) ? event.messages : [];
+    let changed = false;
+    for (const message of messages) {
+      if (accumulateUsage(message)) changed = true;
+    }
+    if (changed) await postSessionUsage();
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
@@ -671,6 +1098,14 @@ module.exports = function (pi) {
     );
     if (blocked) {
       return { block: true, reason: "Interrupted by user" };
+    }
+    // Bridged Omnigent tools (registered via pi.registerTool above) are
+    // policy-evaluated server-side inside the /mcp proxy when execute() runs,
+    // so skip the hook-level eval for them to avoid double-evaluation and, for
+    // ASK policies, a double prompt. Pi's own built-in tools (read/shell/etc)
+    // are NOT bridged and stay gated here.
+    if (bridgedTools.has((event && event.toolName) || "")) {
+      return;
     }
     // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
     // endpoint. This works even after the harness turn has completed (which
@@ -734,6 +1169,10 @@ module.exports = function (pi) {
     await finalizeStreamingMessage(responseId);
     streamingMessageOrdinal += 1;
     await mirrorAssistantMessage(message, responseId);
+    // ``message_end`` is the primary usage-capture site (one completed
+    // assistant message per LLM call); fold its token counts into the
+    // cumulative session totals and flush to the server for pricing.
+    if (accumulateUsage(message)) await postSessionUsage();
     const text = textFromMessage(message);
     if (!text) return;
     // The authoritative assistant item. The web UI retires + replaces the
@@ -758,6 +1197,11 @@ module.exports = function (pi) {
     replayPendingInterrupt(ctx);
     const responseId = currentResponseId();
     await mirrorAssistantMessage(event && event.message, responseId);
+    // Fallback usage capture: if Pi attached usage to the turn's final
+    // assistant message but no ``message_end`` carried it, fold it in here.
+    // Deduped by fingerprint, so a message already counted on ``message_end``
+    // is a no-op.
+    if (accumulateUsage(event && event.message)) await postSessionUsage();
     const results =
       event && Array.isArray(event.toolResults) ? event.toolResults : [];
     for (const result of results) {
