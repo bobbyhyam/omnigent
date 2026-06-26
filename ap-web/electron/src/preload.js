@@ -70,31 +70,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /**
    * This machine's host-connection status for the window's server, e.g.
    * `{cliInstalled, connected, process, hostStatus, sessions, ownedByDesktop,
-   * error}`. Resolves null on pages that aren't a connected server.
+   * error}`. Read-only — hosting is enabled at connect time on the setup page.
+   * Resolves null on pages that aren't a connected server.
    */
   getHostStatus: () => ipcRenderer.invoke("omnigent:host-get-status"),
-  /**
-   * Connect (true) or disconnect (false) this machine as a host for the
-   * window's server. Resolves a `{ok, …}` result.
-   * @param {boolean} enabled
-   */
-  setHostEnabled: (enabled) => ipcRenderer.invoke("omnigent:host-set-enabled", Boolean(enabled)),
   /**
    * Local-server status for the window's server (loopback only); resolves null
    * for remote servers.
    */
   getServerStatus: () => ipcRenderer.invoke("omnigent:server-get-status"),
   /**
-   * Start (true) / stop (false) the local server (loopback servers only; stop
-   * affects only a server this app started). Resolves a `{ok, …}` result.
-   * @param {boolean} running
-   */
-  setServerRunning: (running) =>
-    ipcRenderer.invoke("omnigent:server-set-running", Boolean(running)),
-  /**
-   * Subscribe to pushed host-status updates (emitted on a timer and right after
-   * a toggle). The callback receives the same shape as getHostStatus. Returns
-   * an unsubscribe function.
+   * Subscribe to pushed host-status updates (emitted on a timer). The callback
+   * receives the same shape as getHostStatus. Returns an unsubscribe function.
    * @param {(status: object) => void} callback
    * @returns {() => void}
    */
@@ -111,9 +98,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
 // one to pre-fill the form. Separate object so the SPA never sees it.
 contextBridge.exposeInMainWorld("omnigentSetup", {
   getServerUrl: () => ipcRenderer.invoke("omnigent:get-server-url"),
-  setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
+  /**
+   * Persist + navigate to a server URL. `opts.host` also registers this machine
+   * as a host for the server once it loads (the connect-time hosting choice).
+   * @param {string} url
+   * @param {{ host?: boolean }} [opts]
+   */
+  setServerUrl: (url, opts) =>
+    ipcRenderer.invoke("omnigent:set-server-url", url, { host: Boolean(opts && opts.host) }),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
+  /** The saved "host on connect" preference, to pre-set the toggle. */
+  getHostOnConnect: () => ipcRenderer.invoke("omnigent:get-host-on-connect"),
   /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.

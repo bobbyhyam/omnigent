@@ -224,6 +224,54 @@
       .cli-note.bad {
         color: var(--destructive);
       }
+      /* "Host this machine on connect" toggle, next to Connect. */
+      .host-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 16px;
+        font-size: 14px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .host-row.disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .host-row input {
+        position: absolute;
+        opacity: 0;
+        pointer-events: none;
+      }
+      .switch {
+        position: relative;
+        width: 34px;
+        height: 20px;
+        flex: none;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--foreground) 22%, transparent);
+        transition: background 0.15s;
+      }
+      .switch::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--background);
+        transition: transform 0.15s;
+      }
+      .host-row input:checked + .switch {
+        background: var(--primary);
+      }
+      .host-row input:checked + .switch::after {
+        transform: translateX(14px);
+      }
+      .host-row input:focus-visible + .switch {
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);
+      }
       /* With the native title bar hidden (titleBarStyle "hiddenInset" on
          macOS), this strip is the window's only drag surface on the setup
          page. Harmless elsewhere. */
@@ -258,6 +306,11 @@
         autocomplete="off"
         spellcheck="false"
       />
+      <label class="host-row disabled" id="host-row" hidden>
+        <input type="checkbox" id="host-toggle" disabled />
+        <span class="switch" aria-hidden="true"></span>
+        <span>Host this machine on connect</span>
+      </label>
       <button id="connect">Connect</button>
       <div class="err" id="err"></div>
 
@@ -389,8 +442,9 @@
         button.disabled = true;
         try {
           // setServerUrl persists the URL and navigates this window to it —
-          // after which the server's SPA takes over the window.
-          await setup.setServerUrl(value);
+          // after which the server's SPA takes over the window. The host flag
+          // also registers this machine as a host once the server loads.
+          await setup.setServerUrl(value, { host: hostToggle.checked });
         } catch (e) {
           err.textContent = String(e && e.message ? e.message : e);
           button.disabled = false;
@@ -418,6 +472,11 @@
       const cliPathInput = document.getElementById("cli-path");
       const cliBrowse = document.getElementById("cli-browse");
       const cliPathNote = document.getElementById("cli-path-note");
+      const hostRow = document.getElementById("host-row");
+      const hostToggle = document.getElementById("host-toggle");
+      // Saved "host on connect" preference; pre-sets the toggle once the CLI
+      // is confirmed present.
+      let hostPref = false;
 
       // Copy without a clipboard permission: a transient off-screen textarea +
       // execCommand works on a user gesture in the file:// setup page.
@@ -448,11 +507,15 @@
         // textContent, never innerHTML: the command and version come from the
         // main process and are rendered as inert text.
         cliCmdText.textContent = status.installCommand || "";
-        if (status.installed) {
-          startLocalBtn.disabled = false;
+        const installed = Boolean(status.installed);
+        // Hosting needs the CLI; gate both the toggle and Start-locally on it.
+        startLocalBtn.disabled = !installed;
+        hostToggle.disabled = !installed;
+        hostRow.classList.toggle("disabled", !installed);
+        hostToggle.checked = installed && hostPref;
+        if (installed) {
           cliPanel.hidden = true;
         } else {
-          startLocalBtn.disabled = true;
           cliPanel.hidden = false;
           cliInstall.hidden = false;
           cliTitle.textContent = "Omnigent CLI not found";
@@ -471,9 +534,7 @@
           result = { accepted: false };
         }
         if (result && result.accepted) {
-          cliPathNote.textContent = result.version
-            ? `Found: ${result.version}`
-            : "Found omnigent.";
+          cliPathNote.textContent = result.version ? `Found: ${result.version}` : "Found omnigent.";
           await refreshCliStatus();
         } else {
           cliPathNote.className = "cli-note bad";
@@ -509,20 +570,29 @@
             const result = await setup.startLocalServer();
             if (result && result.ok && result.url) {
               // Hand off to the normal connect/navigate flow; on success the
-              // window loads the server and this page goes away.
+              // window loads the server and this page goes away. Carry the host
+              // choice through so a local server can host this machine too.
               input.value = result.url;
-              await setup.setServerUrl(result.url);
+              await setup.setServerUrl(result.url, { host: hostToggle.checked });
               return;
             }
-            err.textContent =
-              (result && result.error) || "Could not start the local server.";
+            err.textContent = (result && result.error) || "Could not start the local server.";
           } catch (e) {
             err.textContent = String(e && e.message ? e.message : e);
           }
           startLocalBtn.textContent = prev;
           startLocalBtn.disabled = false;
         });
-        refreshCliStatus();
+        // Reveal the host toggle and seed it from the saved preference, then
+        // resolve CLI status (which enables/disables it).
+        hostRow.hidden = false;
+        const prefP = setup.getHostOnConnect
+          ? setup.getHostOnConnect().catch(() => false)
+          : Promise.resolve(false);
+        prefP.then((on) => {
+          hostPref = Boolean(on);
+          refreshCliStatus();
+        });
       } else {
         // Older shell without the CLI bridge: hide the whole local section.
         localSection.hidden = true;

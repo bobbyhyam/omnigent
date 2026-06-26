@@ -1469,7 +1469,7 @@ function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
-  ipcMain.handle("omnigent:set-server-url", async (event, url) => {
+  ipcMain.handle("omnigent:set-server-url", async (event, url, opts) => {
     if (!isSetupPageSender(event)) {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
@@ -1479,6 +1479,9 @@ function registerIpc() {
     // the Omnigent UI mount so the user can paste just the workspace host.
     const target = await expandDatabricksWorkspaceUrl(normalized);
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
+    // Connect-time choice from the setup page: also register this machine as a
+    // host for the server. Persisted so the toggle stays sticky across launches.
+    const host = Boolean(opts && opts.host);
     // Multi-server windows connect without touching the saved server —
     // the connection lives and dies with the window.
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -1487,6 +1490,7 @@ function registerIpc() {
       // The saved default persists immediately even if this load fails:
       // the failure fallback keeps it pre-filled so Connect retries it.
       settings.server_url = target;
+      settings.host_on_connect = host;
       saveSettings(settings);
     }
     if (win) {
@@ -1500,16 +1504,37 @@ function registerIpc() {
           // Only a server that actually responded earns a recents slot —
           // a typo'd or unreachable URL must not show up in the
           // quick-pick list on the setup page.
-          if (ephemeral) return;
-          const settings = loadSettings();
-          rememberRecentServer(settings, target);
-          saveSettings(settings);
+          if (!ephemeral) {
+            const settings = loadSettings();
+            rememberRecentServer(settings, target);
+            saveSettings(settings);
+          }
+          // Start hosting only after the server actually responded, so we never
+          // spawn a host for a typo'd / unreachable URL. Best-effort: a failure
+          // surfaces in the sidebar host indicator, not as a connect error.
+          if (host) {
+            const cliPath = resolvedCliPath();
+            if (cliPath) {
+              serverManager
+                .ensureHostConnected(cliPath, target)
+                .then(broadcastHostStatus)
+                .catch(() => {});
+            }
+          }
         })
         .catch(() => {
           // Load failure is handled by the did-fail-load fallback (setup
           // page with the error); the URL is deliberately not recorded.
         });
     }
+  });
+
+  // Setup page → the saved "host on connect" preference, to pre-set the toggle.
+  ipcMain.handle("omnigent:get-host-on-connect", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-host-on-connect is only available to the setup page");
+    }
+    return Boolean(loadSettings().host_on_connect);
   });
 
   // Setup page → pre-fill the input with any saved URL.
@@ -1713,9 +1738,10 @@ function registerIpc() {
   // -------------------------------------------------------------------------
   // Server management — CLI detection, local server, and host connection.
   //
-  // Setup-page handlers (CLI detection, path config, start-locally) gate on
-  // isSetupPageSender; the in-app status/control handlers gate on
-  // isPinnedOriginSender and act only on the SENDER window's own server.
+  // Setup-page handlers (CLI detection, path config, start-locally, the
+  // connect-time host choice) gate on isSetupPageSender. Hosting is decided at
+  // connect time; the SPA only READS status (gated on isPinnedOriginSender) for
+  // the sidebar host indicator — it has no in-app control endpoints.
   // -------------------------------------------------------------------------
 
   // Setup page → is the `omnigent` CLI installed and runnable? Includes the
@@ -1779,7 +1805,8 @@ function registerIpc() {
     return serverManager.startLocalServer(cliPath);
   });
 
-  // SPA → this machine's host-connection status for the window's own server.
+  // SPA → this machine's host-connection status for the window's own server
+  // (read-only; drives the sidebar host indicator).
   ipcMain.handle("omnigent:host-get-status", async (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] host-get-status from untrusted sender dropped");
@@ -1788,25 +1815,6 @@ function registerIpc() {
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return null;
     return serverManager.statusFor(resolvedCliPath(), serverUrl);
-  });
-
-  // SPA → connect (true) or disconnect (false) this machine as a host for the
-  // window's own server. The explicit opt-in toggle for hosting.
-  ipcMain.handle("omnigent:host-set-enabled", async (event, enabled) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("host-set-enabled is only available to a connected server page");
-    }
-    const serverUrl = senderServerUrl(event);
-    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    const cliPath = resolvedCliPath();
-    if (!cliPath) {
-      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
-    }
-    const result = enabled
-      ? await serverManager.ensureHostConnected(cliPath, serverUrl)
-      : await serverManager.disconnectHost(cliPath, serverUrl);
-    broadcastHostStatus();
-    return result;
   });
 
   // SPA → local-server status (loopback servers only; null otherwise).
@@ -1818,27 +1826,6 @@ function registerIpc() {
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return null;
     return serverManager.serverStatusFor(resolvedCliPath(), serverUrl);
-  });
-
-  // SPA → start (true) / stop (false) the local server, for loopback servers
-  // only. Stop affects only a server this app started.
-  ipcMain.handle("omnigent:server-set-running", async (event, running) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("server-set-running is only available to a connected server page");
-    }
-    const serverUrl = senderServerUrl(event);
-    if (!serverUrl || !omnigentCli.isLoopbackServer(serverUrl)) {
-      return { ok: false, error: "the local-server control applies to loopback servers only" };
-    }
-    const cliPath = resolvedCliPath();
-    if (!cliPath) {
-      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
-    }
-    const result = running
-      ? await serverManager.startLocalServer(cliPath)
-      : await serverManager.stopOwnedLocalServer(cliPath);
-    broadcastHostStatus();
-    return result;
   });
 
   startHostStatusPoller();

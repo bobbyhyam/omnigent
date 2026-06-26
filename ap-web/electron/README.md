@@ -288,9 +288,10 @@ machine that runs the agent work a server dispatches). Two concepts stay
 deliberately separate:
 
 - **Server** — the backend the webview talks to (local or remote).
-- **Host** — *this machine* executing agent work for a server. Because hosting
-  runs agent code, it is **opt-in**: the shell shows host status and connects
-  only when you explicitly enable it.
+- **Host** — _this machine_ executing agent work for a server. Because hosting
+  runs agent code, it is **opt-in**: you choose it on the connect screen via a
+  "Host this machine on connect" toggle next to **Connect**, and the connected
+  app shows live host status in the sidebar.
 
 ### Detecting the CLI (setup page)
 
@@ -314,26 +315,36 @@ needs the CLI — only "Start locally" and hosting do.
 
 **"Start a server on this machine"** runs `omnigent server start` (idempotent —
 reuses a healthy one) and then connects this window to its
-`http://127.0.0.1:<port>` URL through the normal connect flow.
+`http://127.0.0.1:<port>` URL through the normal connect flow. The host toggle
+applies here too, so a local server can host this machine in one step.
 
-### Host status in-app
+### Hosting on connect
 
-Once connected, the SPA can read this machine's host status and toggle hosting
-through the JS bridge (`window.omnigentDesktop` →
-`getHostStatus` / `setHostEnabled` / `getServerStatus` / `setServerRunning` /
-`onHostStatusChanged`; typed wrappers in
-[`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts)). Status is read live
-from `omnigent host status --json` (connected = a live daemon process **and** an
-online host tunnel); the shell never caches it. Enabling hosting either adopts a
-daemon already serving that server (started by hand) or spawns
-`omnigent host --server <url>`. These control methods are gated to the window's
-**pinned origin**, like the badge/notification bridge.
+The **"Host this machine on connect"** toggle on the setup page is the single
+place you opt into hosting (its last state is remembered in `settings.json` as
+`host_on_connect`). When you Connect (or Start locally) with it on, the shell —
+once the server actually responds — either adopts a daemon already serving that
+server (one you started by hand) or spawns `omnigent host --server <url>`. The
+toggle is disabled until the CLI resolves.
+
+### Host status in the sidebar
+
+Inside the connected app, a **read-only** host indicator sits in the sidebar
+next to Settings: a colored dot (green = connected, amber = connecting, muted =
+off / CLI missing) plus a short label and a tooltip with session and
+local-server detail. It reads live from `omnigent host status --json` (connected
+= a live daemon process **and** an online host tunnel; the shell never caches
+it) via the JS bridge — `window.omnigentDesktop` → `getHostStatus` /
+`getServerStatus` / `onHostStatusChanged`, typed in
+[`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts), gated to the window's
+**pinned origin** like the badge/notification bridge. The indicator is
+desktop-shell only and currently shown on the desktop (non-mobile) sidebar.
 
 ### Lifecycle
 
 The desktop **owns the host processes it starts**: quitting the app SIGTERMs
 them (and stops a local server it started), so closing the app disconnects this
-machine. A daemon the shell merely *adopted* (you started it in a terminal) is
+machine. A daemon the shell merely _adopted_ (you started it in a terminal) is
 left running on quit.
 
 ## Passkeys (WebAuthn)

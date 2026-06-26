@@ -120,14 +120,14 @@ interface ElectronDesktopApi extends NativeShellApi {
   switchServer?: (url: string) => Promise<void>;
   /** Return this window to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
-  /** This machine's host-connection status for the window's server, or null. */
+  /**
+   * This machine's host-connection status for the window's server, or null.
+   * Read-only — hosting is enabled at connect time on the shell's setup page,
+   * not from inside the SPA.
+   */
   getHostStatus?: () => Promise<HostStatus | null>;
-  /** Connect (true) / disconnect (false) this machine as a host. */
-  setHostEnabled?: (enabled: boolean) => Promise<HostActionResult>;
   /** Local-server status for the window's server (loopback only), or null. */
   getServerStatus?: () => Promise<LocalServerStatus | null>;
-  /** Start (true) / stop (false) the local server (loopback only). */
-  setServerRunning?: (running: boolean) => Promise<HostActionResult>;
   /** Subscribe to pushed host-status updates; returns an unsubscribe. */
   onHostStatusChanged?: (callback: (status: HostStatus) => void) => () => void;
 }
@@ -158,15 +158,6 @@ export interface LocalServerStatus {
   liveSessions: number;
   /** Whether this desktop app started (and would stop) the local server. */
   ownedByDesktop: boolean;
-}
-
-/** Result of a host/server control action from the desktop shell. */
-export interface HostActionResult {
-  ok: boolean;
-  error?: string;
-  ownedByDesktop?: boolean;
-  adopted?: boolean;
-  url?: string;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */
@@ -483,23 +474,6 @@ export async function getHostStatus(): Promise<HostStatus | null> {
 }
 
 /**
- * Ask the desktop shell to connect (`true`) or disconnect (`false`) this
- * machine as a host for the window's server. Hosting means this machine runs
- * agent work the server dispatches, so it's an explicit opt-in. Resolves a
- * `{ ok, error? }` result; a no-op `{ ok: false }` outside the shell.
- */
-export async function setHostEnabled(enabled: boolean): Promise<HostActionResult> {
-  const electron = electronApi();
-  if (!electron?.setHostEnabled) return { ok: false, error: "not running under the desktop shell" };
-  try {
-    return await electron.setHostEnabled(enabled);
-  } catch (err) {
-    console.warn("[nativeBridge] electron setHostEnabled failed:", err);
-    return { ok: false, error: String(err) };
-  }
-}
-
-/**
  * Fetch local-server status for the window's server from the desktop shell.
  * Resolves `null` outside the shell or for non-loopback (remote) servers, where
  * the local-server controls don't apply.
@@ -516,25 +490,8 @@ export async function getLocalServerStatus(): Promise<LocalServerStatus | null> 
 }
 
 /**
- * Ask the desktop shell to start (`true`) or stop (`false`) the local server
- * (loopback servers only; stop affects only a server this app started).
- * Resolves a `{ ok, error? }` result; a no-op `{ ok: false }` outside the shell.
- */
-export async function setLocalServerRunning(running: boolean): Promise<HostActionResult> {
-  const electron = electronApi();
-  if (!electron?.setServerRunning)
-    return { ok: false, error: "not running under the desktop shell" };
-  try {
-    return await electron.setServerRunning(running);
-  } catch (err) {
-    console.warn("[nativeBridge] electron setServerRunning failed:", err);
-    return { ok: false, error: String(err) };
-  }
-}
-
-/**
- * Subscribe to host-status updates pushed by the desktop shell (on a timer and
- * right after a connect/disconnect toggle), so an in-app indicator stays live.
+ * Subscribe to host-status updates pushed by the desktop shell (on a timer), so
+ * the in-app host indicator stays live.
  *
  * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
  * outside the Electron shell or under a shell too old to push updates, so
