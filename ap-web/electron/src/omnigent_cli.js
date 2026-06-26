@@ -21,6 +21,7 @@ const { execFile, execFileSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const yaml = require("js-yaml");
 
 const url = require("./url");
 
@@ -98,6 +99,47 @@ function localDataDir() {
     return path.resolve(expanded);
   }
   return path.join(os.homedir(), ".omnigent");
+}
+
+/**
+ * The Omnigent config dir — `$OMNIGENT_CONFIG_HOME` (with `~` expanded) or
+ * `~/.omnigent`. config.yaml (machine identity) lives here; it can differ from
+ * the data dir under test env overrides, but is the same by default.
+ *
+ * @returns {string}
+ */
+function localConfigDir() {
+  const raw = process.env.OMNIGENT_CONFIG_HOME;
+  if (raw && raw.trim() !== "") {
+    const expanded = raw.startsWith("~") ? path.join(os.homedir(), raw.slice(1)) : raw;
+    return path.resolve(expanded);
+  }
+  return path.join(os.homedir(), ".omnigent");
+}
+
+/** Memoized machine host id (stable once generated; never cache a null). */
+let cachedHostId = null;
+
+/**
+ * This machine's Omnigent host id (e.g. "host_ab12…"), read from the machine
+ * identity in `config.yaml` (`host: host_id:`, written by
+ * omnigent/host/identity.py) — instant, no subprocess. Present once generated,
+ * even before connecting to any server. Returns null when no id exists yet;
+ * after the first connect it resolves. Lets the renderer match "this machine"
+ * against the server's /v1/hosts list and select it after an auto-connect.
+ *
+ * @returns {string | null}
+ */
+function localHostId() {
+  if (cachedHostId) return cachedHostId;
+  try {
+    const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
+    const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
+    if (typeof id === "string" && id) cachedHostId = id;
+  } catch {
+    // No config yet, or unparseable.
+  }
+  return cachedHostId;
 }
 
 /**
@@ -510,6 +552,7 @@ module.exports = {
   normalizeServerUrl,
   isLoopbackServer,
   sameLoopbackServer,
+  localHostId,
   parseLocalServerPidfile,
   isPidAlive,
   readLocalServerPidfile,

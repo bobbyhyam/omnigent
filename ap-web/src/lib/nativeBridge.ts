@@ -149,6 +149,12 @@ export interface HostStatus {
   process: "online" | "offline";
   /** The server-reported host tunnel state, e.g. "online", or null. */
   hostStatus: string | null;
+  /**
+   * This machine's host id (from the local config), or null if it has none yet.
+   * Lets the SPA match "this machine" against the server's host list and select
+   * it after an auto-connect.
+   */
+  hostId: string | null;
   /** Whether this desktop app started (and owns) the host connection. */
   ownedByDesktop: boolean;
   /** A status error from the CLI, or null. */

@@ -399,10 +399,15 @@ async function statusFor(cliPath, serverUrl) {
       connected: false,
       process: "offline",
       hostStatus: null,
+      hostId: null,
       ownedByDesktop: false,
       error: null,
     };
   }
+  // This machine's host id (from on-disk daemon records; null until it has
+  // connected at least once). Lets the renderer match "this machine" in the
+  // server's host list and select it after an auto-connect.
+  const hostId = cli.localHostId();
   const key = cli.normalizeServerUrl(serverUrl);
   // A connect is in flight for this server (auto-restore, connect-time, or a
   // Start that hasn't tunneled yet) — report "connecting" without a subprocess
@@ -414,6 +419,7 @@ async function statusFor(cliPath, serverUrl) {
       connected: false,
       process: "online",
       hostStatus: null,
+      hostId,
       ownedByDesktop: true,
       error: null,
     };
@@ -427,6 +433,7 @@ async function statusFor(cliPath, serverUrl) {
       connected: true,
       process: "online",
       hostStatus: "online",
+      hostId,
       ownedByDesktop: true,
       error: null,
     };
@@ -436,6 +443,7 @@ async function statusFor(cliPath, serverUrl) {
   return {
     cliInstalled: true,
     ...conn,
+    hostId,
     ownedByDesktop: ownsLiveHost(key),
   };
 }
