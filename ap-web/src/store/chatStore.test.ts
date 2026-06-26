@@ -2715,9 +2715,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         ],
         pendingByConversation: {
           conv_old: {
-            messages: [
-              { tempId: "pend_clear", content: [{ type: "input_text", text: "/clear" }] },
-            ],
+            messages: [{ tempId: "pend_clear", content: [{ type: "input_text", text: "/clear" }] }],
             committedTexts: [],
           },
         },

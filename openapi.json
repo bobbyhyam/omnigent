@@ -4756,15 +4756,17 @@
         "type": "object"
       },
       "SessionSupersededEvent": {
-        "description": "This conversation was superseded by another and clients should\nfollow to it.\n\nEmitted by ``_publish_session_superseded`` in\n``omnigent/server/routes/sessions.py`` when the claude-native\nforwarder rotates a session away on a Claude ``/clear`` (the old\nconversation keeps its history but the live terminal moves to a\nfresh conversation \u2014 see ``_post_clear_supersession`` in\n``omnigent/claude_native_forwarder.py``). A client actively viewing\nthe superseded conversation auto-redirects to ``target_conversation_id``.\n\nCategory: **transient** (SSE-only), live-only by design. There is no\nSSE replay: a client that connects after the rotation does not get\nthis event. The durable counterpart is the persisted notice message\nappended to the old conversation (a ``message`` item linking to the\nnew conversation), which a reloading client renders instead of being\nforce-redirected.\n\nThe wire shape is FLAT (not enveloped):\n``{\"type\": \"session.superseded\", \"conversation_id\": <old>,\n\"target_conversation_id\": <new>, \"reason\": \"clear\"}``.\n\n:param type: Always ``\"session.superseded\"``.\n:param conversation_id: The superseded (old) conversation id this\n    event rides the stream of, e.g. ``\"conv_old\"``.\n:param target_conversation_id: The conversation to follow to, e.g.\n    ``\"conv_new\"``.\n:param reason: Why the session was superseded. Currently always\n    ``\"clear\"`` (a Claude Code ``/clear``); kept as a field so the\n    client can branch on future supersession causes.",
+        "description": "This conversation was superseded by another and clients should\nfollow to it.\n\nEmitted by `_publish_session_superseded` in\n`omnigent/server/routes/sessions.py` when the claude-native\nforwarder rotates a session away on a Claude `/clear` (the old\nconversation keeps its history but the live terminal moves to a\nfresh conversation \u2014 see `_post_clear_supersession` in\n`omnigent/claude_native_forwarder.py`). A client actively viewing\nthe superseded conversation auto-redirects to `target_conversation_id`.\n\nCategory: **transient** (SSE-only), live-only by design. There is no\nSSE replay: a client that connects after the rotation does not get\nthis event. The durable counterpart is the persisted notice message\nappended to the old conversation (a `message` item linking to the\nnew conversation), which a reloading client renders instead of being\nforce-redirected.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.superseded\", \"conversation_id\": <old>, \"target_conversation_id\": <new>, \"reason\": \"clear\"}`.",
         "properties": {
           "conversation_id": {
+            "description": "The superseded (old) conversation id this event rides the stream of, e.g. `\"conv_old\"`.",
             "title": "Conversation Id",
             "type": "string"
           },
           "reason": {
             "const": "clear",
             "default": "clear",
+            "description": "Why the session was superseded. Currently always `\"clear\"` (a Claude Code `/clear`); kept as a field so the client can branch on future supersession causes.",
             "title": "Reason",
             "type": "string"
           },
@@ -4781,11 +4783,13 @@
             "title": "Sequence Number"
           },
           "target_conversation_id": {
+            "description": "The conversation to follow to, e.g. `\"conv_new\"`.",
             "title": "Target Conversation Id",
             "type": "string"
           },
           "type": {
             "const": "session.superseded",
+            "description": "Always `\"session.superseded\"`.",
             "title": "Type",
             "type": "string"
           }

@@ -81,8 +81,6 @@ describe("parseEvent — session.superseded", () => {
   });
 
   it("returns null when the carrier conversation id is missing", () => {
-    expect(
-      parseEvent("session.superseded", { target_conversation_id: "conv_new" }),
-    ).toBeNull();
+    expect(parseEvent("session.superseded", { target_conversation_id: "conv_new" })).toBeNull();
   });
 });
