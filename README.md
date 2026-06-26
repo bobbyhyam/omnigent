@@ -9,6 +9,7 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![GitHub tag](https://img.shields.io/github/v/tag/omnigent-ai/omnigent.svg?label=tag)](https://github.com/omnigent-ai/omnigent/tags)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/omnigent)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](#1-install)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
@@ -17,7 +18,8 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 </div>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-hero.png" alt="An Omnigent orchestrator and its sub-agents in one shared session" width="520" />
+  <!-- TODO: replace with the final desktop-app screenshot at docs/images/omnigent-desktop.png -->
+  <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-desktop.png" alt="The Omnigent desktop app showing a live agent session in its terminal view" width="640" />
 </p>
 
 ---
