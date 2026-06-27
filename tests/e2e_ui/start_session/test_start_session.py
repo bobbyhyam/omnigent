@@ -662,13 +662,15 @@ async def _drive_agent_picker_pagination_dedupe(base_url: str, session_id: str) 
             await expect(picker).to_contain_text("Codex")
             await picker.click()
 
-            await expect(page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")).to_be_visible()
-            await expect(page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_1")).to_have_count(
-                0
-            )
-            await expect(page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_2")).to_have_count(
-                0
-            )
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
+            ).to_be_visible()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_1")
+            ).to_have_count(0)
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_2")
+            ).to_have_count(0)
 
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
