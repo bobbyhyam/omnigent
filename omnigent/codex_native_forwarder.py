@@ -5127,42 +5127,12 @@ def _read_compacted_history(rollout_path: Path) -> list[dict[str, object]] | Non
     history = payload.get("replacement_history")
     if not isinstance(history, list) or not history:
         return None
-    # Convert ResponseItems to the harness input format.
-    msgs: list[dict[str, object]] = []
-    for item in history:
-        if not isinstance(item, dict):
-            continue
-        # ResponseItem shapes: {type: "message", role, content},
-        # {type: "function_call", ...}, {type: "function_call_output", ...}
-        item_type = item.get("type")
-        if item_type == "message":
-            role = item.get("role")
-            if role in ("user", "assistant"):
-                msgs.append(
-                    {
-                        "type": "message",
-                        "role": role,
-                        "content": item.get("content", []),
-                    }
-                )
-        elif item_type == "function_call":
-            msgs.append(
-                {
-                    "type": "function_call",
-                    "call_id": item.get("call_id"),
-                    "name": item.get("name"),
-                    "arguments": item.get("arguments"),
-                }
-            )
-        elif item_type == "function_call_output":
-            msgs.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": item.get("call_id"),
-                    "output": item.get("output"),
-                }
-            )
-    return msgs if msgs else None
+    # Store the replacement_history as-is. It contains the full
+    # post-compaction context including opaque compaction tokens
+    # ({type: "compaction", encrypted_content: "..."}), user
+    # messages, and any other ResponseItem types. Filtering would
+    # lose the compaction tokens which ARE the compacted context.
+    return [item for item in history if isinstance(item, dict)] or None
 
 
 async def _handle_reasoning_delta(
