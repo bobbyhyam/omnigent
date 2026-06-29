@@ -403,8 +403,11 @@ Legend: ✅ confirmed in code · ⚠️ partial/caveated · ❌ confirmed absent
 all ❌ except `supports_tool_calling`) + native permission modules. SDK and native rows are split — they diverge a lot.
 
 **Column meanings (do not re-conflate):**
-- **interrupt** = `executor.interrupt_session()` actually stops the *running* turn (the product Stop path). Base
-  default ❌. A human Ctrl+C in a native pane is **not** this.
+- **interrupt** = the product "Stop" actually stops the *running* turn. SDK harnesses wire this via
+  `executor.interrupt_session()` (base default ❌); **native harnesses wire it at the bridge** instead — e.g.
+  claude-native injects Claude's `Escape` into the pane via `inject_interrupt` (`claude_native_bridge.py:2484`).
+  Read this column as "can the web Stop button interrupt," **not** "does the executor method exist" (the first
+  verification pass conflated the two and wrongly marked claude-native ❌).
 - **queue** = `supports_live_message_queue()` (mid-turn steer).
 - **subagents** = a sub-agent shows up as a child session — gated by the **tool surface** (SDK harnesses bridge
   `sys_session_send`; claude-native via `external_subagent_start`), *not* an executor flag.
@@ -420,7 +423,7 @@ all ❌ except `supports_tool_calling`) + native permission modules. SDK and nat
 
 | Native harness | interrupt | queue | subagents | reasoning effort | elicitation | mid-session model |
 |---|---|---|---|---|---|---|
-| claude-native | ❌ | ✅ | ✅ | ✅ via `/effort` | ✅ | ✅ (next turn) |
+| claude-native | ✅ (Escape via bridge `inject_interrupt`) | ✅ | ✅ | ✅ via `/effort` | ✅ | ✅ (next turn) |
 | codex-native | ✅ (turn/interrupt RPC) | ✅ | ⚠️† | ✅ {…openai} | ✅ | ✅ |
 
 **Polly / general custom agents** have no row of their own — they run on a chosen harness (typically **claude-sdk**)
@@ -478,6 +481,7 @@ session_usage,compaction_status}`. Reasoning: streamed as `ReasoningChunk`; pers
    surfaced error). [§2.A]
 8. **Streaming↔durable dedup hinges on `itemId`** — the FIFO-desync bug class lives here. [§2.A, memory]
 9. **Native mid-session model override may not affect the running turn** — only next turn. [§2.B]
-10. **claude-native has no product-"Stop" interrupt** — its executor doesn't override `interrupt_session()`
-    (base ❌), so the web Stop button silently no-ops; only Claude's own in-pane Ctrl+C works. claude-sdk and
-    codex(+native) DO wire interrupt. [§4]
+
+   _(Note: interrupt is NOT a gap — all in-scope harnesses support the web Stop button: claude-sdk/codex via
+   `executor.interrupt_session()`, claude-native via bridge `inject_interrupt` (Escape), codex-native via
+   `turn/interrupt` RPC.)_
