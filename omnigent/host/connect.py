@@ -314,13 +314,22 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # not match what the host owner configured (e.g. a non-standard
         # kubeconfig location or a colon-separated multi-file list).
         "KUBECONFIG",
+        # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
+        # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
+        # telemetry.init() no-ops there and omni-runner / omni-harness export
+        # nothing — inheriting OTEL_* alone is no longer enough now that
+        # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
+        # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
+        "OMNIGENT_TELEMETRY_ENABLED",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
     | set(WINDOWS_ENV_PASSTHROUGH)
 )
-# Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")
+# Allowed by prefix: locale family (``LC_*``), MLflow, and OpenTelemetry config —
+# both the standard ``OTEL_*`` vars and Omnigent's ``OMNIGENT_OTEL_*`` knobs
+# (capture-content, FastAPI toggle) so they reach the runner/harness too.
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "OMNIGENT_OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
