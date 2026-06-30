@@ -152,9 +152,7 @@ describe("SmartRoutingCard — failure", () => {
     const error =
       "Error: the routing advisor is unavailable right now (judge call failed); " +
       "dispatch with your own model choices.";
-    render(
-      <SmartRoutingCard arguments={TWO_TASK_ARGS} output={error} state="output-available" />,
-    );
+    render(<SmartRoutingCard arguments={TWO_TASK_ARGS} output={error} state="output-available" />);
     expect(card().getAttribute("data-state-kind")).toBe("failed");
     // The error text is the honest content — rendering rows would imply an
     // enforced plan exists when none was installed.

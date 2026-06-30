@@ -53,7 +53,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -12614,6 +12614,148 @@ async def _child_session_summaries_from_conversations(
 # factory so the factory closure stays compact.
 
 
+def _mcp_tool_result(rpc_id: int | str | None, text: str) -> Response:
+    """
+    Wrap a plain-text tool result in a JSON-RPC 2.0 MCP ``tools/call`` response.
+
+    :param rpc_id: The JSON-RPC request id (may be int, str, or ``None``
+        for notifications), e.g. ``1``.
+    :param text: The tool output text to embed in the ``content`` block.
+    :returns: A :class:`Response` with ``Content-Type: application/json``
+        carrying the JSON-RPC 2.0 envelope with a single ``text`` content block.
+    """
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": rpc_id, "result": {"content": [{"type": "text", "text": text}]}}
+    )
+    return Response(content=body, media_type="application/json")
+
+
+async def _handle_advise_models_mcp(
+    rpc_id: int | str | None,
+    conv: Any,
+    arguments: dict[str, Any],
+    agent_store: Any,
+) -> Response:
+    """
+    Server-side handler for ``sys_advise_models`` MCP tool calls.
+
+    Intercepts the call before the runner forward because
+    ``RuntimeCaps.routing_client`` lives in the server process.
+
+    :param rpc_id: The JSON-RPC request id.
+    :param conv: The :class:`Conversation` for this session.
+    :param arguments: Parsed tool arguments from the LLM.
+    :param agent_store: Store for agent lookup (used to resolve sub-agent harnesses).
+    :returns: A JSON-RPC 2.0 ``tools/call`` result response.
+    """
+    tasks = arguments.get("tasks")
+    if not isinstance(tasks, list):
+        return _mcp_tool_result(
+            rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
+        )
+
+    caps = get_caps()
+    routing_client = caps.routing_client
+    if routing_client is None:
+        return _mcp_tool_result(
+            rpc_id, json.dumps({"router_on": False, "recommendations": []})
+        )
+
+    from omnigent.model_catalog import spec_harness
+    from omnigent.server.smart_routing import infer_tiers
+
+    # Resolve the parent agent spec to look up sub-agent harnesses.
+    spec: Any | None = None
+    if conv.agent_id is not None:
+        agent_obj = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent_obj is not None:
+            try:
+                spec = (
+                    get_agent_cache()
+                    .load(
+                        agent_obj.id,
+                        agent_obj.bundle_location,
+                        expand_env=agent_obj.session_id is None,
+                    )
+                    .spec
+                )
+            except Exception:  # noqa: BLE001
+                _logger.debug(
+                    "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
+                )
+
+    _WORKER_HARNESS: dict[str, str] = {
+        "claude_code": "claude-sdk",
+        "codex": "codex",
+        "pi": "openai-agents",
+    }
+
+    def _resolve_harness_for_worker(agent: str) -> str | None:
+        if spec is not None:
+            sub_agents = getattr(spec, "sub_agents", None) or []
+            for sub in sub_agents:
+                if getattr(sub, "name", None) == agent:
+                    h = spec_harness(sub)
+                    if h:
+                        return h
+                    break
+        return _WORKER_HARNESS.get(agent)
+
+    recommendations: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        title = task.get("title", "")
+        agent = task.get("agent", "")
+        task_text = task.get("task", "")
+        harness = _resolve_harness_for_worker(agent)
+        tiers = infer_tiers(harness) if harness else None
+        if tiers is None:
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": agent,
+                    "model": None,
+                    "tier": None,
+                    "rationale": f"no tiers available for harness {harness!r}",
+                }
+            )
+            continue
+        try:
+            verdict = await routing_client.route(task_text, tiers)
+        except Exception:  # routing failures must not crash the advisor
+            _logger.exception(
+                "_handle_advise_models_mcp: routing_client.route failed for task %r agent %r",
+                title,
+                agent,
+            )
+            verdict = None
+        if verdict is None:
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": agent,
+                    "model": None,
+                    "tier": None,
+                    "rationale": "router returned no verdict",
+                }
+            )
+        else:
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": agent,
+                    "model": verdict.model,
+                    "tier": verdict.tier,
+                    "rationale": verdict.rationale,
+                }
+            )
+
+    return _mcp_tool_result(
+        rpc_id, json.dumps({"router_on": True, "recommendations": recommendations})
+    )
+
+
 def _mcp_ok_response(rpc_id: int | str | None, result: dict[str, Any]) -> Response:
     """
     Wrap *result* in a JSON-RPC 2.0 success response.
@@ -12887,6 +13029,13 @@ async def _handle_mcp_tools_call(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return _mcp_error_response(rpc_id, -32000, f"Agent not found: {conv.agent_id!r}")
+
+    # ── Server-side sys_advise_models intercept ──────────────────────────
+    # The advisor runs server-side (RuntimeCaps.routing_client lives
+    # here); intercept before the runner forward.
+    if namespaced_name == "sys_advise_models":
+        return await _handle_advise_models_mcp(rpc_id, conv, arguments, agent_store)
+    # ─────────────────────────────────────────────────────────────────────
 
     # Build the policy engine once — used for both TOOL_CALL (first call
     # only) and TOOL_RESULT (both paths). Engine construction reads
@@ -19718,140 +19867,6 @@ def create_sessions_router(
             )
 
         return _mcp_error_response(rpc_id, -32601, f"Method not found: {method!r}")
-
-    # ── POST /sessions/{id}/advise-models ─────────────────────────
-
-    class _AdviseTask(BaseModel):
-        title: str
-        agent: str
-        task: str
-
-    class _AdviseModelsRequest(BaseModel):
-        tasks: list[_AdviseTask]
-
-    @router.post(
-        "/sessions/{session_id}/advise-models",
-        include_in_schema=False,
-        response_model=None,
-    )
-    async def advise_models(
-        request: Request,
-        session_id: str,
-        body: _AdviseModelsRequest,
-    ) -> dict[str, Any]:
-        """
-        Recommend a model for each fan-out task.
-
-        Server-side endpoint that uses ``RuntimeCaps.routing_client``
-        (available in this process) to advise the runner on which model
-        to assign to each fan-out worker task.
-
-        :param request: The incoming FastAPI request (for auth).
-        :param session_id: Session identifier, e.g. ``"conv_abc123"``.
-        :param body: Request body with a ``tasks`` list.
-        :returns: ``{"router_on": bool, "recommendations": [...]}``.
-        :raises OmnigentError: 404 if no session or no access,
-            401 if unauthenticated.
-        """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-        )
-        conv = access.conversation
-        if conv is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
-
-        caps = get_caps()
-        routing_client = caps.routing_client
-        if routing_client is None:
-            return {"router_on": False, "recommendations": []}
-
-        from omnigent.model_catalog import spec_harness
-        from omnigent.server.smart_routing import infer_tiers
-
-        # Resolve the parent agent spec to look up sub-agent harnesses.
-        spec: AgentSpec | None = None
-        if conv.agent_id is not None:
-            agent_obj = await asyncio.to_thread(agent_store.get, conv.agent_id)
-            if agent_obj is not None:
-                try:
-                    spec = (
-                        get_agent_cache()
-                        .load(
-                            agent_obj.id,
-                            agent_obj.bundle_location,
-                            expand_env=agent_obj.session_id is None,
-                        )
-                        .spec
-                    )
-                except Exception:  # noqa: BLE001
-                    _logger.debug("advise_models: failed to load spec for agent=%s", conv.agent_id)
-
-        _WORKER_HARNESS: dict[str, str] = {
-            "claude_code": "claude-sdk",
-            "codex": "codex",
-            "pi": "openai-agents",
-        }
-
-        def _resolve_harness_for_worker(agent: str) -> str | None:
-            if spec is not None:
-                sub_agents = getattr(spec, "sub_agents", None) or []
-                for sub in sub_agents:
-                    if getattr(sub, "name", None) == agent:
-                        h = spec_harness(sub)
-                        if h:
-                            return h
-                        break
-            return _WORKER_HARNESS.get(agent)
-
-        recommendations: list[dict[str, Any]] = []
-        for advise_task in body.tasks:
-            harness = _resolve_harness_for_worker(advise_task.agent)
-            tiers = infer_tiers(harness) if harness else None
-            if tiers is None:
-                recommendations.append(
-                    {
-                        "title": advise_task.title,
-                        "agent": advise_task.agent,
-                        "model": None,
-                        "tier": None,
-                        "rationale": f"no tiers available for harness {harness!r}",
-                    }
-                )
-                continue
-            try:
-                verdict = await routing_client.route(advise_task.task, tiers)
-            except Exception:  # routing failures must not crash the advisor
-                _logger.exception(
-                    "advise_models: routing_client.route failed for task %r agent %r",
-                    advise_task.title,
-                    advise_task.agent,
-                )
-                verdict = None
-            if verdict is None:
-                recommendations.append(
-                    {
-                        "title": advise_task.title,
-                        "agent": advise_task.agent,
-                        "model": None,
-                        "tier": None,
-                        "rationale": "router returned no verdict",
-                    }
-                )
-            else:
-                recommendations.append(
-                    {
-                        "title": advise_task.title,
-                        "agent": advise_task.agent,
-                        "model": verdict.model,
-                        "tier": verdict.tier,
-                        "rationale": verdict.rationale,
-                    }
-                )
-
-        return {"router_on": True, "recommendations": recommendations}
 
     return router
 

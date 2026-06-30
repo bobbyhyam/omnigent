@@ -257,11 +257,6 @@ _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 
-# Priority 5f.3: sys_advise_models — runner-local fan-out advisor.
-# Reads RuntimeCaps.routing_client and calls async route(); only
-# registered when routing_client is configured.
-_ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
-
 # Priority 5g: Timer tools — runner-local asyncio.sleep tasks
 # (RUNNER_TIMER_DISPATCH.md).
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
@@ -325,7 +320,6 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
-    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -456,7 +450,6 @@ _ALL_LOCAL_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
-    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
@@ -1141,46 +1134,6 @@ async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
 
     catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
     return json.dumps(catalog)
-
-
-async def _execute_advise_models_tool(
-    args: dict[str, Any],
-    *,
-    server_client: httpx.AsyncClient | None,
-    conversation_id: str | None,
-) -> str:
-    """
-    Dispatch ``sys_advise_models``: fan-out model sizing recommendations.
-
-    Delegates to the server-side ``POST /v1/sessions/{id}/advise-models``
-    endpoint where ``RuntimeCaps.routing_client`` is available.
-
-    :param args: Parsed arguments from the LLM. Expected key:
-        ``tasks`` — list of ``{title, agent, task}`` dicts.
-    :param server_client: httpx client pointed at the Omnigent server.
-    :param conversation_id: Parent conversation id.
-    :returns: JSON ``{"recommendations": [...], "router_on": bool}``.
-    """
-    if server_client is None or conversation_id is None:
-        return json.dumps(
-            {"error": "sys_advise_models requires server_client", "router_on": False}
-        )
-    tasks = args.get("tasks")
-    if not isinstance(tasks, list):
-        return json.dumps({"error": "tasks must be a list", "router_on": False})
-    try:
-        resp = await server_client.post(
-            f"/v1/sessions/{conversation_id}/advise-models",
-            json={"tasks": tasks},
-            timeout=30.0,
-        )
-        if resp.status_code >= 400:
-            return json.dumps(
-                {"error": f"advisor returned {resp.status_code}", "router_on": False}
-            )
-        return resp.text
-    except httpx.HTTPError as exc:
-        return json.dumps({"error": str(exc), "router_on": False})
 
 
 async def _execute_subagent_tool(
@@ -4125,12 +4078,6 @@ async def execute_tool(
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
-        elif tool_name in _ADVISE_MODELS_TOOLS:
-            output = await _execute_advise_models_tool(
-                args,
-                server_client=server_client,
-                conversation_id=conversation_id,
-            )
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,
