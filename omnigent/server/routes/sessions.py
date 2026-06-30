@@ -8427,7 +8427,8 @@ async def _emit_server_routing_decision(
             session_id,
             {COST_CONTROL_PLAN_LABEL: label_value},
         )
-    except (OSError, ValueError):
+        _logger.info("Server routing: persisted verdict label for session=%s", session_id)
+    except Exception:  # noqa: BLE001  # best-effort label; must not crash routing
         _logger.warning(
             "Server routing: failed to persist verdict label for session=%s",
             session_id,
