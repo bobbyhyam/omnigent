@@ -43,21 +43,16 @@ export function parsePlannedTasks(args: Record<string, unknown>): PlannedTask[] 
     if (typeof entry !== "object" || entry === null) continue;
     const rec = entry as Record<string, unknown>;
     if (typeof rec.title !== "string" || rec.title.length === 0) continue;
-    // New shape: agents: [{agent, models}]
-    if (Array.isArray(rec.agents)) {
-      for (const ae of rec.agents) {
-        if (
-          typeof ae === "object" &&
-          ae !== null &&
-          typeof (ae as Record<string, unknown>).agent === "string"
-        ) {
-          tasks.push({ title: rec.title, agent: (ae as Record<string, unknown>).agent as string });
-        }
-      }
-    } else if (typeof rec.agent === "string") {
-      // Legacy single-agent shape (backwards compat)
-      tasks.push({ title: rec.title, agent: rec.agent });
+    // One row per task. Collect agent names for display during judging
+    // (the recommendation will have the definitive chosen agent).
+    let agentHint = "";
+    if (Array.isArray(rec.agents) && rec.agents.length > 0) {
+      agentHint = (rec.agents as Record<string, unknown>[])
+        .map((a) => (typeof a.agent === "string" ? a.agent : ""))
+        .filter(Boolean)
+        .join(", ");
     }
+    tasks.push({ title: rec.title, agent: agentHint });
   }
   return tasks;
 }
@@ -92,8 +87,7 @@ export function parseRecommendations(output: string): Map<string, Recommendation
     ) {
       const agent = typeof rec.agent === "string" ? rec.agent : "";
       const title = rec.title as string;
-      // Key by "title:agent" so multiple agents per task don't collide.
-      map.set(`${title}:${agent}`, {
+      map.set(title, {
         model: rec.model,
         title,
         rationale: typeof rec.rationale === "string" ? rec.rationale : "",
@@ -137,7 +131,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
   // a sized plan still renders rows.
   const tasks = useMemo(() => {
     if (plannedTasks.length > 0 || recommendations === null) return plannedTasks;
-    return [...recommendations.values()].map((rec) => ({ title: rec.title, agent: rec.agent }));
+    return [...recommendations.values()].map((rec) => ({ title: rec.title, agent: "" }));
   }, [plannedTasks, recommendations]);
   const judging = state === "input-available";
   // Any terminal state without parseable recommendations is a failure:
@@ -191,13 +185,15 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
         </p>
       ) : (
         tasks.map((task, i) => {
-          const rec = recommendations?.get(`${task.title}:${task.agent}`) ?? null;
+          const rec = recommendations?.get(task.title) ?? null;
           return (
-            <div key={`${task.title}:${task.agent}`} className="flex flex-col gap-0.5">
+            <div key={task.title} className="flex flex-col gap-0.5">
               <div className="flex items-center gap-2 text-xs">
                 <span className="min-w-0 truncate font-mono text-foreground">{task.title}</span>
-                {task.agent.length > 0 && (
-                  <span className="shrink-0 text-muted-foreground/70">→ {task.agent}</span>
+                {(rec?.agent ?? task.agent).length > 0 && (
+                  <span className="shrink-0 text-muted-foreground/70">
+                    → {rec?.agent ?? task.agent}
+                  </span>
                 )}
                 <span className="ml-auto shrink-0">
                   {rec !== null ? (

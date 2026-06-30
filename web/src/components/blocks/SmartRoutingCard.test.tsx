@@ -39,29 +39,19 @@ const TWO_TASK_OUTPUT = JSON.stringify({
 const card = () => screen.getByTestId("smart-routing-card");
 
 describe("parsePlannedTasks", () => {
-  it("expands agents array into one row per agent", () => {
+  it("returns one row per task title (agent comes from response)", () => {
     const tasks = parsePlannedTasks({
       tasks: [
-        {
-          title: "refactor",
-          agents: [{ agent: "claude_code" }, { agent: "pi" }],
-          task: "x",
-        },
+        { title: "refactor", agents: [{ agent: "claude_code" }, { agent: "pi" }], task: "x" },
+        { title: "review", agents: [{ agent: "codex" }], task: "y" },
         { title: "", agents: [{ agent: "codex" }] }, // empty title → dropped
-        "not-an-object", // → dropped
+        "not-an-object",
       ],
     });
     expect(tasks).toEqual([
-      { title: "refactor", agent: "claude_code" },
-      { title: "refactor", agent: "pi" },
+      { title: "refactor", agent: "claude_code, pi" }, // hint from args for display during judging
+      { title: "review", agent: "codex" },
     ]);
-  });
-
-  it("accepts legacy single-agent shape for backwards compat", () => {
-    const tasks = parsePlannedTasks({
-      tasks: [{ title: "a", agent: "codex", task: "x" }],
-    });
-    expect(tasks).toEqual([{ title: "a", agent: "codex" }]);
   });
 
   it("returns [] when tasks is missing or not an array", () => {
@@ -74,7 +64,7 @@ describe("parseRecommendations", () => {
   it("maps titles to model/rationale/agent (no tier)", () => {
     const recs = parseRecommendations(TWO_TASK_OUTPUT);
     expect(recs).not.toBeNull();
-    expect(recs!.get("refactor-auth:claude_code")).toEqual({
+    expect(recs!.get("refactor-auth")).toEqual({
       model: "databricks-claude-opus-4-8",
       title: "refactor-auth",
       rationale: "Multi-file refactor needs deep reasoning.",
@@ -100,7 +90,7 @@ describe("SmartRoutingCard — judging (in-flight)", () => {
     // Rows render immediately from the args so the plan shape is visible
     // while the judge runs.
     expect(card()).toHaveTextContent("review-security");
-    expect(card()).toHaveTextContent("→ codex");
+    expect(card()).toHaveTextContent("→ codex"); // agent hint from args
     // Per-row shimmer verbs cycle the pool by row index: row 0 → weighing, row 1 → matching.
     expect(card()).toHaveTextContent("weighing…");
     expect(card()).toHaveTextContent("matching…");
