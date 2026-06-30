@@ -12291,54 +12291,55 @@ def create_runner_app(
 
     async def _native_cost_popup_config_file(conv_id: str, harness: str) -> Path:
         """
-        Resolve the AP-routing config file the cost popup reads, per harness.
+        Mint the AP-routing config the cost popup reads, per harness.
 
-        The popup script reads ``ap_server_url`` + ``ap_auth_headers`` from
-        this file: ``permission_hook.json`` in the claude-native bridge dir,
-        ``policy_hook.json`` in the codex-native bridge dir. opencode-native
-        has no permission/policy hook of its own (it gates via the SSE
-        forwarder), so there is no such file at rest — write a fresh snapshot
-        here (the only consumer is this popup).
+        The popup subprocess reads ``ap_server_url`` + ``ap_auth_headers``
+        from this file and replays the static headers when POSTing its
+        verdict. claude/codex used to point it at their long-lived
+        ``permission_hook.json`` / ``policy_hook.json`` — but those carry the
+        one-shot launch token, which dies with the ~1h Databricks OAuth
+        lifetime, so a cost gate firing late in a session would 401 the
+        verdict and silently lose the approval. Mint a fresh bearer here (the
+        popup launches right after) and pair it with the workspace-routing
+        header — bearer alone misroutes the POST to the account — for every
+        harness uniformly.
 
         :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
         :param harness: ``"claude-native"``, ``"codex-native"``, or
             ``"opencode-native"``.
-        :returns: Path to the harness's AP-routing config file.
+        :returns: Path to the freshly-written popup config file.
         """
+        from omnigent.cli_auth import databricks_request_headers
+        from omnigent.opencode_native_bridge import write_cost_popup_config
+        from omnigent.runner._entry import _make_auth_token_factory
+
         if harness == "claude-native":
             from omnigent import claude_native_bridge as _cnb
 
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client, session_id=conv_id
             )
-            return _cnb.bridge_dir_for_bridge_id(bridge_id) / _cnb._PERMISSION_HOOK_FILE
-        if harness == "opencode-native":
-            # opencode is the one harness whose popup config is minted fresh here
-            # (claude/codex reuse their permission/policy hook files, which carry
-            # the routing header already). The popup subprocess replays these
-            # static headers, so pair the bearer with the workspace-routing
-            # header — bearer alone misroutes the popup's POST to the account.
-            from omnigent.cli_auth import databricks_request_headers
+            bridge_dir = _cnb.bridge_dir_for_bridge_id(bridge_id)
+        elif harness == "opencode-native":
             from omnigent.opencode_native_bridge import (
                 bridge_dir_for_bridge_id as _oc_bridge_dir,
             )
-            from omnigent.opencode_native_bridge import (
-                write_cost_popup_config,
-            )
-            from omnigent.runner._entry import _make_auth_token_factory
 
-            _server_url = _required_runner_env("RUNNER_SERVER_URL")
-            _factory = _make_auth_token_factory()
-            _token = _factory() if _factory is not None else None
-            return await asyncio.to_thread(
-                write_cost_popup_config,
-                _oc_bridge_dir(conv_id),
-                ap_server_url=_server_url,
-                ap_auth_headers=databricks_request_headers(_server_url, bearer_token=_token),
-            )
-        from omnigent import codex_native_bridge as _cxb
+            bridge_dir = _oc_bridge_dir(conv_id)
+        else:  # codex-native
+            from omnigent import codex_native_bridge as _cxb
 
-        return _cxb.bridge_dir_for_bridge_id(conv_id) / _cxb._POLICY_HOOK_FILE
+            bridge_dir = _cxb.bridge_dir_for_bridge_id(conv_id)
+
+        _server_url = _required_runner_env("RUNNER_SERVER_URL")
+        _factory = _make_auth_token_factory()
+        _token = _factory() if _factory is not None else None
+        return await asyncio.to_thread(
+            write_cost_popup_config,
+            bridge_dir,
+            ap_server_url=_server_url,
+            ap_auth_headers=databricks_request_headers(_server_url, bearer_token=_token),
+        )
 
     async def _repop_pending_cost_popup_on_attach(
         conv_id: str,
