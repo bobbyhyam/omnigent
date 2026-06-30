@@ -8503,7 +8503,12 @@ async def _forward_event_to_runner(
         _harness = _resolve_harness(conv)
         _user_text = _extract_user_text_for_routing(body)
         if _user_text:
-            _routed_model, _verdict = await route_turn(_harness, _user_text)
+            _routed_model, _verdict = await route_turn(
+                _harness,
+                _user_text,
+                session_id=session_id,
+                conversation_store=conversation_store,
+            )
             if _routed_model is not None:
                 effective_runner_override = _routed_model
                 # Persist as the session's model_override so all
@@ -8711,7 +8716,12 @@ async def _dispatch_session_event_to_runner(
             _harness = _resolve_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
             if _user_text:
-                _routed_model, _verdict = await route_turn(_harness, _user_text)
+                _routed_model, _verdict = await route_turn(
+                    _harness,
+                    _user_text,
+                    session_id=session_id,
+                    conversation_store=conversation_store,
+                )
                 if _routed_model is not None:
                     try:
                         await asyncio.to_thread(
