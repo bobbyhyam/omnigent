@@ -236,6 +236,19 @@ def set_session_id(session_id: str | None) -> None:
         pass
 
 
+def current_session_id() -> str | None:
+    """
+    Return the session id bound in the current context, or ``None``.
+
+    Lets a caller (e.g. the executor adapter) prefer the conversation id the
+    request hook already bound — authoritative, from the ``/sessions/<conv>/``
+    path — over a less-reliable local key.
+
+    :returns: The active ``session.id`` value, or ``None`` if unset.
+    """
+    return _session_id_var.get()
+
+
 @contextmanager
 def session_scope(session_id: str | None) -> Iterator[None]:
     """
