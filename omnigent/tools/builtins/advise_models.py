@@ -1,16 +1,16 @@
 """Built-in tool: sys_advise_models — fan-out model sizing advisor.
 
-Recommends a model tier for each sub-agent task the orchestrator is
-about to launch, using the server's :class:`~omnigent.server.smart_routing.RoutingClient`.
-The tool is available when ``RuntimeCaps.routing_client`` is configured
-(i.e. ``OMNIGENT_SMART_ROUTING=1`` with an ``llm:`` config block) and
-is advisory-only — it does not enforce the recommended model on the
-resulting ``sys_session_send`` calls.
+This class exists solely to provide the tool **schema** to
+:class:`~omnigent.tools.manager.ToolManager` so the LLM can see and
+call ``sys_advise_models``.  Execution is handled server-side: the
+Omnigent server intercepts the ``tools/call`` in
+:func:`~omnigent.server.routes.sessions._handle_advise_models_mcp`
+before the MCP proxy ever reaches the runner.
 
-Real dispatch logic lives in
-:func:`~omnigent.runner.tool_dispatch._execute_advise_models_tool`; the
-:meth:`invoke` below is the in-process fallback path (raises a clear
-error rather than silently returning wrong data).
+The tool is registered by ``ToolManager`` when:
+- ``tools.agents`` is declared in the spec, AND
+- ``RuntimeCaps.routing_client`` is configured
+  (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config block).
 """
 
 from __future__ import annotations
@@ -110,17 +110,20 @@ class SysAdviseModelsTool(Tool):
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
-        In-process fallback (raises — real dispatch is in the runner).
+        Unreachable — execution is intercepted server-side.
+
+        The server's MCP handler intercepts ``sys_advise_models`` in
+        :func:`~omnigent.server.routes.sessions._handle_advise_models_mcp`
+        and returns the result directly.  ``invoke`` is never called
+        in practice; it exists only to satisfy the :class:`Tool`
+        abstract interface.
 
         :param arguments: JSON-encoded arguments (unused).
         :param ctx: Tool execution context (unused).
-        :raises RuntimeError: Always — this path is not supported; the
-            runner intercepts ``sys_advise_models`` before it reaches
-            ``ToolManager.call_tool``.
+        :raises RuntimeError: Always, if somehow reached.
         """
         del arguments, ctx
         raise RuntimeError(
-            "sys_advise_models must be dispatched via the runner "
-            "(_execute_advise_models_tool); in-process invocation is "
-            "not supported."
+            "sys_advise_models is handled server-side via the MCP "
+            "intercept; this invoke() path should never be reached."
         )
