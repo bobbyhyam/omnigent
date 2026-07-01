@@ -5070,9 +5070,10 @@ function AgentPicker({
   // carried over from some other session) nor the meaningless `llmModel`
   // default. The other vendor-owns wrappers have no Omnigent-visible model and
   // stay null.
-  // kiro is launch-only: the picked model is persisted as ``model_override`` and
-  // applied via ``--model`` at launch. There is no terminal→web mirror, so the
-  // picker reflects that pre-launch selection (``sessionModelOverride``), like
+  // kiro persists the pick as ``model_override`` (applied via ``--model`` at
+  // launch) and, mid-session, the runner types ``/model <id>`` into the live TUI.
+  // There is no terminal→web mirror, so the picker reflects the web-side
+  // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
   // cursor/opencode surface theirs.
   const pickerSelectedModel =
     modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
@@ -5088,9 +5089,9 @@ function AgentPicker({
     modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-      ? // cursor mirrors its live TUI model into ``model_override``; kiro has no
-        // mirror but persists the launch-time pick there. Either way the
-        // Omnigent-visible model is ``model_override``.
+      ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
+        // on a web pick (which also drives a live ``/model`` switch). Either way
+        // the Omnigent-visible model is ``model_override``.
         sessionModelOverride
       : modelPickerKind === "opencode"
         ? // opencode mirrors its live TUI model into ``model_override`` (set at
