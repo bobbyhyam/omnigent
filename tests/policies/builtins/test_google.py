@@ -470,10 +470,28 @@ def test_no_write_down_write_outside_compartment_denied() -> None:
 
 
 def test_no_write_down_write_inside_compartment_allowed() -> None:
-    """After reading confidential, a write to a confidential file is allowed."""
-    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    """After reading confidential, a write to a confidential file the agent may
+    write (here, in ``write_files``) is allowed — it stays inside the set.
+
+    The no-write-down check does not fire (target is confidential), and the base
+    write rule permits it because the file is explicitly writable.
+    """
+    policy = gdrive_policy(confidential_files=[_CONF_ID], write_files=[_CONF_ID])
     state = {"gdrive_read_confidential": True}
     assert policy(tc("mcp__google__drive_file_update", {"file_id": _CONF_ID}, state)) is None
+
+
+def test_no_write_down_confidential_does_not_grant_write() -> None:
+    """Declaring a file confidential does not by itself make it writable.
+
+    Guards against a boundary-widening side effect: a confidential file the
+    agent neither created nor has in ``write_files`` is still denied by the base
+    write rule (``confidential_files`` is a containment declaration, not a
+    write grant).
+    """
+    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    result = policy(tc("mcp__google__drive_file_update", {"file_id": _CONF_ID}))
+    assert result is not None and result["result"] == "DENY"
 
 
 def test_no_write_down_create_after_confidential_denied() -> None:

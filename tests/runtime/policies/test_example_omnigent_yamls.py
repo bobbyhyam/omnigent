@@ -423,17 +423,20 @@ async def test_info_flow_blocks_write_out_after_reading_confidential(
 
 
 @pytest.mark.asyncio
-async def test_info_flow_allows_write_back_into_confidential(
+async def test_info_flow_confidential_files_does_not_grant_write(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    Loaded from YAML: after reading the confidential doc, writing back to it is allowed.
+    Loaded from YAML: declaring a file confidential does not make it writable.
 
-    The write stays inside the confidential compartment, so it is not a
-    write-down and passes.
+    The example lists the doc in ``confidential_files`` but not ``write_files``,
+    and the agent never created it, so a write to it is denied by the base write
+    rule — ``confidential_files`` is a containment declaration, not a write
+    grant. (The no-write-down check itself abstains here, since the target is in
+    the confidential set; the denial comes from the base scope rule.)
 
-    Claim: a write confined to the confidential set is permitted through the real
-    load + engine pipeline.
+    Claim: through the real load + engine pipeline, ``confidential_files`` does
+    not widen the write boundary.
     """
     engine = _load_engine_from_yaml(_INFO_FLOW, conversation_store)
     await _enforce_policy(
@@ -444,4 +447,4 @@ async def test_info_flow_allows_write_back_into_confidential(
         engine,
         _tool_ctx("mcp__google__docs_document_batch_update", {"document_id": _CONF_DOC_ID}),
     )
-    assert write.action == PolicyAction.ALLOW
+    assert write.action == PolicyAction.DENY

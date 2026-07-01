@@ -640,9 +640,12 @@ def _decide_drive_tool_call(
     if canonical in _DRIVE_WRITE_TOOLS:
         if not target_ids:
             return _deny(f"{cfg.deny_reason} Write call carries no identifiable target file.")
-        # Confidential files are writable: they are explicitly declared, and the
-        # no-write-down check above already governs flows *out* of them.
-        if target_ids <= (cfg.write_ids | cfg.confidential_ids | created_ids):
+        # ``confidential_files`` is purely a containment declaration: it does NOT
+        # by itself grant write access. Writing to a confidential file still
+        # requires it to be created this session or in ``write_files`` — so a
+        # confidential doc the agent created stays writable (until it reads
+        # another confidential file, which the no-write-down check above gates).
+        if target_ids <= (cfg.write_ids | created_ids):
             return None
         extra = " or the configured write allowlist" if cfg.write_ids else ""
         return _deny(
@@ -749,7 +752,12 @@ def gdrive_policy(
         ``None`` / empty means the rule is off and the base access policy behaves
         exactly as before. This enforces only the write-down rule; it does NOT
         restrict reads (the agent must read a confidential file for the
-        containment to engage).
+        containment to engage) and does NOT by itself grant write access to the
+        listed files — writing to a confidential file still requires it to be
+        created this session or in ``write_files``. Note the latch engages only
+        on reads that target a confidential file *by id*; content-returning
+        reads that don't name a specific file (e.g. ``drive_search``, listing,
+        or exports) can surface confidential text without engaging containment.
     :param write_down_action: Verdict on a write-down violation — ``"DENY"``
         (default, hard block) or ``"ASK"`` (human approval). Ignored when
         ``confidential_files`` is empty.
