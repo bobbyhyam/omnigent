@@ -34,7 +34,7 @@ production surprise.
   dimension.
 - Adding a new *official* harness needs at most a one-line registry entry plus a
   self-declared profile — never per-probe code.
-- An *unofficial* / out-of-repo harness that ships a bench profile can be probed
+- A *community* / out-of-repo harness that ships a bench profile can be probed
   with `--harness <name>` and no bench edits.
 - Detect drift between what a harness *declares* and what it *does*.
 
@@ -79,7 +79,7 @@ This satisfies both use cases:
 
 - **Official harnesses** — already in `_HARNESS_MODULES`; the bench iterates the
   list and `--harness <name>` selects one.
-- **Unofficial harnesses** — `--harness <name>` resolution falls back (when the
+- **Community harnesses** — `--harness <name>` resolution falls back (when the
   name is not in the registry) to any harness that exposes a `BenchProfile`
   (e.g. `--harness mypkg.myharness`, or a name resolved via an installed
   plugin). A ~10-line resolution shim, not the full discovery system.
