@@ -82,10 +82,13 @@ def infra_failure_reason(result: TurnResult) -> str | None:
         return None
     for code in ("403", "401"):
         if code in text:
+            # Provider-neutral: any harness can hit this when its credential is
+            # expired or shadowed by an ambient env var (a stale bearer/API-key/
+            # token) that takes precedence over the configured auth source.
             return (
-                f"gateway auth failed ({code} Invalid/Forbidden token); "
-                "re-login the profile, or clear a stale DATABRICKS_BEARER / "
-                "DATABRICKS_TOKEN env var that overrides profile auth"
+                f"auth rejected ({code} Invalid/Forbidden token); the harness "
+                "credential is stale or shadowed by an ambient env var. Refresh "
+                "the harness auth source (profile, API key, or token env var)"
             )
     if "already processing" in text:
         return "session busy from a prior turn (sequencing, not a capability gap)"
