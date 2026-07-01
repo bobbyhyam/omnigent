@@ -130,7 +130,7 @@ This inversion is visible in the trace corpus: an SDK turn (`conv_32db…`) show
 | **WS `/sessions/updates`** | server → **web only** | sidebar watch-set snapshot + changed/removed deltas + heartbeat | TUI does **not** use this |
 | **WS reverse-tunnel** (`/v1/runners/{id}/tunnel`) | runner (client) ↔ server | **all** server↔runner HTTP, framed; headers verbatim | runner dials out; 30s ping / 3-miss death |
 | **WS control frames** (`/v1/hosts/{id}/tunnel`) | host ↔ server | JSON `kind`-discriminated frames (launch/stop/stat/fs ops) | NOT HTTP; per-`request_id` Future multiplexing |
-| **UDS / in-proc** | runner → harness/executor | turn input + events | the executor subprocess (or in-proc) |
+| **UDS (real HTTP)** | runner → harness | turn input + events | harness is a subprocess reached via `httpx(uds=…)` → uvicorn; the *executor object* is in-process WITHIN that harness |
 | **tmux send-keys + log-poll** | runner/forwarder ↔ native vendor CLI | keystroke inject + JSONL transcript mirror | native only; async, off the request trace |
 
 ---
@@ -147,13 +147,18 @@ This inversion is visible in the trace corpus: an SDK turn (`conv_32db…`) show
               → POST runner /events  (over WS tunnel, S:8697)
               → publish session.input.consumed (client dedup anchor)
 4. RUNNER  pulls context from server (over tunnel): GET /agent/contents, GET /items, GET /skills
-   └─ instantiates executor; runs the in-process loop
+   └─ instantiates executor; drives the harness SUBPROCESS via ONE long-lived streaming
+      POST /v1/sessions/{id}/events — real HTTP over UDS (httpx → uvicorn), NOT in-process
 5. POLICY  in-process policy.evaluate spans on server: PHASE_REQUEST → LLM_REQUEST → LLM_RESPONSE
-6. STREAM  executor emits ExecutorEvents → runner → server → SSE response.* deltas to client
+6. STREAM  executor yields ExecutorEvents → harness streams them back as SSE frames on the
+           RESPONSE BODY of step-4's POST (the harness never calls the runner) → runner relays
+           → server → SSE response.* deltas to client
    └─ DURABILITY: only OutputItemDoneEvent persists as a conversation item;
                   reasoning + all response.* deltas are SSE-only (never persisted)
-7. TOOLS   (if any) runner → server POST /mcp  (policy gate: TOOL_CALL, then TOOL_RESULT)
-                    → server → runner POST /mcp/execute  (the actual execution)
+7. TOOLS   (if any) harness emits action_required in its stream → runner → server POST /mcp
+                    (policy gate: TOOL_CALL, then TOOL_RESULT) → server → runner POST /mcp/execute
+                    (the actual execution) → runner POSTs {tool_result} back to the harness
+                    /events (a SEPARATE short POST, not PATCH) so the loop continues
 8. DONE    TurnComplete → status idle (in-memory _session_status_cache) → SSE [DONE] on stream end
 ```
 
@@ -736,8 +741,8 @@ Confirmed against trace corpus `conv_fc47380…` (subagent) and `conv_32db3f59�
 ##### 4c. Server → runner (HTTP over tunnel) — corpus `omni-server → omni-runner`
 `POST /v1/sessions` (create/start), `GET /v1/sessions/{id}` (probe), `POST …/events` (turn drive + control events), `POST …/mcp/execute` (tool exec), `GET …/resources/terminals`, `GET …/skills`. All dispatched via `RunnerRouter.client_for_session_resources`/`client_for_conversation` (routing.py:89/118) → `WSTunnelTransport`.
 
-##### 4d. Runner → harness (in-process or subprocess; HTTP)
-`POST /v1/sessions/{conv}/events` to the harness process — corpus edge `omni-runner → omni-harness` ×10 (subagent). The runner is the harness's controller: it forwards the resolved message (`process_manager.get_client(conv).post(…)`, app.py:14780) for mid-turn injection, and consumes the harness SSE for the streaming turn (`_stream_message_to_harness`, app.py:14892). For **native** harnesses the "harness" is a TUI in a tmux pane; control is via key sends, not HTTP (interrupt routing app.py:14928-14958).
+##### 4d. Runner → harness (real HTTP over a UDS; runner is always the client)
+The live path is **not** in-process: the harness is a child subprocess (`python -m omnigent.runtime.harnesses._runner`, one per (conversation, harness, model)) running a `uvicorn.Server` over a per-harness `create_app()` FastAPI app bound to a Unix domain socket; the runner reaches it with `httpx.AsyncHTTPTransport(uds=…)` (`process_manager.py:1027,1054`). `POST /v1/sessions/{conv}/events` — corpus edge `omni-runner → omni-harness` ×10 (subagent). The direction is one-sided: **the runner is always the HTTP client; the harness only responds and never calls the runner.** The turn is ONE long-lived streaming request (`client.stream(...)`, `app.py:14215`); ExecutorEvents come back as SSE frames on that request's response body, consumed by `_stream_message_to_harness` (`app.py:14892`). When the harness needs a tool run or policy verdict it emits `action_required` / `policy_evaluation.requested` in that stream; the runner services it and posts the result back with a **separate short** `POST …/events` (`{tool_result,call_id}` `tool_dispatch.py:4346`; `{policy_verdict}` `_evaluate_policy_via_omnigent` `app.py:6261`) — a POST, not a PATCH. For **native** harnesses the executor's `run_turn` does ONE inject (tmux send-keys) and returns an empty stream; the transcript is mirrored back out-of-band by the runner-resident forwarder task (see §7-Executor). Interrupt routing app.py:14928-14958.
 
 ---
 
