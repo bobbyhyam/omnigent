@@ -63,6 +63,26 @@ _TASK_SWITCH_SCHEMA: dict[str, Any] = {
 }
 
 
+def _strip_code_fences(text: str) -> str:
+    """Strip markdown code fences from LLM output.
+
+    Even with structured output, some providers wrap JSON in
+    triple-backtick fences. This strips the outermost fence
+    so ``json.loads`` succeeds.
+
+    :param text: Raw LLM response text.
+    :returns: Text with code fences removed.
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        first_newline = stripped.find("\n")
+        if first_newline != -1:
+            stripped = stripped[first_newline + 1 :]
+        if stripped.rstrip().endswith("```"):
+            stripped = stripped.rstrip()[:-3].rstrip()
+    return stripped
+
+
 def _extract_text(response: Any) -> str:
     """Pull plain text out of a PolicyLLMClient response."""
     text = getattr(response, "output_text", None)
@@ -79,7 +99,7 @@ def _extract_text(response: Any) -> str:
 
 def detect_task_switch(
     *,
-    min_turns: int = 2,
+    min_turns: int = 1,
     history_window: int = 4,
     action: str = "ASK",
     classification_prompt: str = _DEFAULT_TASK_SWITCH_PROMPT,
@@ -87,21 +107,35 @@ def detect_task_switch(
     """Factory: detect when the user switches to an unrelated task.
 
     Fires on ``request`` events.  Maintains a rolling window of recent
-    user messages in ``session_state`` and, once enough history has
-    accumulated, asks the server-level LLM to classify the latest
-    message as ``CONTINUATION`` or ``TASK_SWITCH``.
+    user messages in ``session_state`` and, once ``min_turns`` prior
+    messages have accumulated, asks the server-level LLM to classify the
+    latest message as ``CONTINUATION`` or ``TASK_SWITCH``.
 
     On ``TASK_SWITCH`` the policy returns *action* with a message
-    recommending a fresh session — not compaction or summarisation.
+    recommending a fresh session — not compaction or summarisation.  The
+    window is reset to contain only the switching message so the new
+    task can accumulate its own history from a clean state (``DENY``
+    path only — the ``ASK`` path cannot write state on decline, so the
+    window advances only once the user approves and the next request
+    arrives).
     On ``CONTINUATION`` the policy records the new message into state
     and abstains, letting the request through.
 
     Requires the server to have an ``llm:`` config block; abstains
     (fail-open) when no LLM client is available.
 
-    :param min_turns: Number of user messages to accumulate before the
-        classifier starts firing.  Defaults to ``2`` — a single prior
-        message is enough context to detect a switch.
+    .. note::
+        ``action="DENY"`` is not a security control — user messages are
+        interpolated into the classifier prompt and a determined user can
+        craft a message that forces a ``CONTINUATION`` verdict (prompt
+        injection).  Use this policy for context-hygiene guidance, not
+        for access control.
+
+    :param min_turns: Number of prior messages to accumulate before the
+        classifier starts firing.  With the default of ``1`` the
+        classifier fires on the **second** user message (one prior
+        message is enough context to detect a switch).  Set to ``0`` to
+        classify from the very first message.
     :param history_window: Maximum number of recent user messages kept
         in state as prior context for the classifier.  Defaults to
         ``4``.  Older messages are dropped as the window slides.
@@ -191,6 +225,7 @@ def detect_task_switch(
             raw = _extract_text(response)
             if not raw:
                 return None
+            raw = _strip_code_fences(raw)
             verdict_obj = json.loads(raw)
         except Exception:  # noqa: BLE001 — fail-open
             _log.exception("detect_task_switch: classifier call failed")
@@ -200,6 +235,12 @@ def detect_task_switch(
 
         if verdict == "TASK_SWITCH":
             _log.info("detect_task_switch: TASK_SWITCH detected — action=%s", normalised_action)
+            # Reset the window to the switching message alone so the new
+            # task accumulates fresh history from here.  state_updates on a
+            # DENY are applied immediately; state_updates on an ASK are only
+            # applied if the user approves — on decline the window stays
+            # pinned, so the next message will be re-classified against the
+            # pre-switch context (which is the safe / over-prompting direction).
             return {
                 "result": normalised_action,
                 "reason": (
@@ -208,6 +249,13 @@ def detect_task_switch(
                     "waste capacity without helping here. "
                     "Start a fresh session for this task to keep context lean."
                 ),
+                "state_updates": [
+                    {
+                        "key": _TASK_SWITCH_HISTORY_KEY,
+                        "action": "set",
+                        "value": [new_message[:500]],
+                    }
+                ],
             }
 
         if verdict == "CONTINUATION":
