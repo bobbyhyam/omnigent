@@ -9,6 +9,7 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -67,6 +68,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -280,13 +282,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
-        # Native-Claude launcher plugin selector (``module.path:callable``).
-        # Read by omnigent.claude_launcher.resolve_claude_launch in the
-        # managed-host runner (``_auto_create_claude_terminal``) to wrap the
+        # Native-Claude launcher plugin selector: the entry-point NAME of a
+        # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
+        # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
+        # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
         # Claude launch through a downstream binary (e.g. Databricks' isaac).
         # The daemon→runner env strip would otherwise drop it, leaving the
         # runner on the default launch. Safe to propagate: not a secret, just a
-        # plugin reference string.
+        # plugin name.
         "OMNIGENT_CLAUDE_LAUNCHER",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
@@ -312,13 +315,22 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # not match what the host owner configured (e.g. a non-standard
         # kubeconfig location or a colon-separated multi-file list).
         "KUBECONFIG",
+        # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
+        # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
+        # telemetry.init() no-ops there and omni-runner / omni-harness export
+        # nothing — inheriting OTEL_* alone is no longer enough now that
+        # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
+        # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
+        "OMNIGENT_TELEMETRY_ENABLED",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
     | set(WINDOWS_ENV_PASSTHROUGH)
 )
-# Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")
+# Allowed by prefix: locale family (``LC_*``), MLflow, and OpenTelemetry config —
+# both the standard ``OTEL_*`` vars and Omnigent's ``OMNIGENT_OTEL_*`` knobs
+# (capture-content, FastAPI toggle) so they reach the runner/harness too.
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "OMNIGENT_OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
@@ -712,6 +724,17 @@ class HostProcess:
                 "or the server is running a build that predates the host API "
                 "(the /v1/hosts tunnel route). Confirm you have access and that "
                 "the server is up to date, then retry. " + self._login_fix_hint()
+            )
+        if status == 409:
+            return HostConnectError(
+                "Connection refused (HTTP 409): this machine is already "
+                "registered to a different account on this server, so the "
+                "account you authenticated as cannot claim it. This usually "
+                "means the host was first registered under another identity "
+                "(e.g. the single-user 'local' owner before the server "
+                "switched to accounts auth). Ask an administrator to remove "
+                "the existing host registration, or reset this machine's host "
+                "id, then retry. " + self._login_fix_hint()
             )
         return HostConnectError(
             f"Connection refused (HTTP {status}): the server rejected the host "
@@ -1413,9 +1436,9 @@ class HostProcess:
         # Workspace routing: the tunnel handshake must name the workspace or
         # it routes to the account. Empty for single-workspace and managed
         # hosts (no recorded selector), so neither is affected.
-        from omnigent.cli_auth import databricks_org_id_headers
+        from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_org_id_headers(self._server_url))
+        headers.update(databricks_request_headers(self._server_url))
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
@@ -1451,7 +1474,7 @@ class HostProcess:
             to the reconnect loop in :meth:`run`.
         """
         hello = HostHelloFrame(
-            version="0.1.0",
+            version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
@@ -1514,7 +1537,22 @@ class HostProcess:
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
             return
-        await self._dispatch_host_frame(ws, frame)
+        # Handle the frame inside a CONSUMER span parented on the trace
+        # context the server stamped into the frame envelope, so the
+        # host's work (and the result frame it sends back) nests under
+        # the server request that triggered it.
+        from omnigent.runtime import telemetry
+
+        try:
+            carrier = json.loads(raw)
+        except ValueError:
+            carrier = {}
+        if not isinstance(carrier, dict):
+            carrier = {}
+        raw_kind = carrier.get("kind")
+        kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
+        with telemetry.consume_frame_span(kind, carrier):
+            await self._dispatch_host_frame(ws, frame)
 
     async def _dispatch_host_frame(
         self,
@@ -1562,6 +1600,14 @@ def run_host_process(
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
+    # Initialize tracing so the host daemon exports its own spans
+    # (e.g. handling launch_runner / stat / list_dir frames) into the
+    # same distributed trace as the server that requested them. The
+    # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
+    from omnigent.runtime import telemetry
+
+    telemetry.init("omni-host")
+
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH
