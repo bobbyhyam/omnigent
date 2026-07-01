@@ -272,6 +272,69 @@ def test_no_write_tools_disables_write_down_enforcement() -> None:
     assert result["result"] == "ALLOW"
 
 
+# ── MCP prefix matching ───────────────────────────────────────────────────────
+
+
+def test_mcp_prefixed_tool_call_matches_canonical_name() -> None:
+    """Raw tool name with MCP prefix matches bare canonical name in tool_levels."""
+    policy = bell_lapadula(
+        levels=_LEVELS,
+        clearance="internal",
+        tool_levels={"hr_system": "confidential"},
+    )
+    # "mcp__omnigent__hr_system" should match canonical "hr_system" → DENY (no-read-up)
+    event = {
+        "type": "tool_call",
+        "target": "mcp__omnigent__hr_system",
+        "data": {"name": "mcp__omnigent__hr_system", "arguments": {}},
+        "context": {},
+        "session_state": {},
+    }
+    result = policy(event)
+    assert result["result"] == "DENY"
+    assert "no-read-up" in result["reason"]
+
+
+def test_mcp_prefixed_tool_result_advances_read_mark() -> None:
+    """tool_result with MCP prefix advances the read mark."""
+    policy = bell_lapadula(
+        levels=_LEVELS,
+        clearance="secret",
+        tool_levels={"confidential_db": "confidential"},
+    )
+    event = {
+        "type": "tool_result",
+        "target": "mcp__omnigent__confidential_db",
+        "data": {},
+        "context": {},
+        "session_state": {_BLP_READ_MARK_KEY: 0},
+    }
+    result = policy(event)
+    assert result["result"] == "ALLOW"
+    updates = {u["key"]: u["value"] for u in result["state_updates"]}
+    assert updates[_BLP_READ_MARK_KEY] == 2  # "confidential" is index 2
+
+
+def test_mcp_prefixed_write_tool_triggers_no_write_down() -> None:
+    """Write-down check fires when the write tool carries an MCP prefix."""
+    policy = bell_lapadula(
+        levels=_LEVELS,
+        clearance="secret",
+        tool_levels={"shell": "public"},
+        write_tools=["shell"],
+    )
+    event = {
+        "type": "tool_call",
+        "target": "mcp__omnigent__shell",
+        "data": {"name": "mcp__omnigent__shell", "arguments": {}},
+        "context": {},
+        "session_state": {_BLP_READ_MARK_KEY: 2},  # read_mark = confidential
+    }
+    result = policy(event)
+    assert result["result"] == "DENY"
+    assert "no-write-down" in result["reason"]
+
+
 # ── registry ──────────────────────────────────────────────────────────────────
 
 

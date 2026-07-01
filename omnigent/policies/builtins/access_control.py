@@ -7,7 +7,7 @@ classical mandatory-access-control model for **confidentiality**:
   whose classification level exceeds the agent's clearance.  A "DENY" fires
   on ``tool_call`` before the tool runs.
 
-- **No write down** (Star Property / \*-property): once the agent has received
+- **No write down** (Star Property / ``*``-property): once the agent has received
   a result from a tool at level *L*, it may not subsequently invoke a tool
   classified below *L* whose purpose is to write or exfiltrate data.  The
   policy tracks the agent's "contamination high-water mark" in
@@ -57,6 +57,21 @@ _ALLOW: PolicyResponse = {"result": "ALLOW"}
 # session_state key storing the agent's current read high-water mark (the
 # classification level of the highest-classified tool result seen so far).
 _BLP_READ_MARK_KEY = "_blp_read_mark"
+
+
+def _tool_matches(raw_tool: str, name: str) -> bool:
+    """Check whether a raw event tool name matches a configured canonical name.
+
+    MCP-agnostic: matches on exact equality or on a ``"__"``-delimited suffix,
+    so ``"sys_read_hr_data"`` matches ``"mcp__omnigent__sys_read_hr_data"`` and
+    the bare name alike, without requiring server prefixes in the config.
+
+    :param raw_tool: Tool name from the event, e.g.
+        ``"mcp__omnigent__sys_read_hr_data"``.
+    :param name: Configured canonical tool name, e.g. ``"sys_read_hr_data"``.
+    :returns: ``True`` when *raw_tool* refers to *name*.
+    """
+    return raw_tool == name or raw_tool.endswith(f"__{name}")
 
 
 def bell_lapadula(
@@ -136,11 +151,19 @@ def bell_lapadula(
         phase = event.get("type")
         tool_name: str = event.get("target") or ""
 
+        # ── resolve tool name (MCP-prefix-agnostic) ──────────────────────
+        # ``resolved`` keys are canonical names (e.g. "sys_read_hr_data").
+        # The raw event target may carry an MCP server prefix such as
+        # "mcp__omnigent__sys_read_hr_data".  _tool_matches handles both.
+        matched_canonical: str | None = next(
+            (name for name in resolved if _tool_matches(tool_name, name)), None
+        )
+
         # ── tool_result: advance the read high-water mark ─────────────────
         if phase == "tool_result":
-            tool_level_idx = resolved.get(tool_name)
-            if tool_level_idx is None:
+            if matched_canonical is None:
                 return _ALLOW  # unclassified tool — no mark change
+            tool_level_idx = resolved[matched_canonical]
             state = event.get("session_state") or {}
             current_mark: int = int(state.get(_BLP_READ_MARK_KEY) or 0)
             if tool_level_idx <= current_mark:
@@ -160,9 +183,10 @@ def bell_lapadula(
         if phase != "tool_call":
             return _ALLOW
 
-        tool_level_idx = resolved.get(tool_name)
-        if tool_level_idx is None:
+        if matched_canonical is None:
             return _ALLOW  # unclassified tool — no restriction
+
+        tool_level_idx = resolved[matched_canonical]
 
         # No read up: agent clearance must be >= tool's level.
         if tool_level_idx > clearance_idx:
@@ -178,7 +202,7 @@ def bell_lapadula(
             }
 
         # No write down: if this is a write sink, its level must be >= read mark.
-        if tool_name in write_set:
+        if any(_tool_matches(tool_name, wt) for wt in write_set):
             state = event.get("session_state") or {}
             read_mark: int = int(state.get(_BLP_READ_MARK_KEY) or 0)
             if tool_level_idx < read_mark:
