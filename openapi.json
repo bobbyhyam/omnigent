@@ -4225,6 +4225,18 @@
       "SessionResponse": {
         "description": "API representation of a session.\n\nReturned by `POST /v1/sessions`, `GET /v1/sessions/{id}`,\nand `PATCH /v1/sessions/{id}`.",
         "properties": {
+          "active_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Response id of the turn currently in flight, or `None` when the session is idle. Sourced from the server's `_session_active_response_cache` at snapshot build time so a client connecting mid-turn can reopen a streaming `activeResponse` \u2014 the SSE stream is snapshot + live tail with no replay, so the turn-start `running` edge that carried this id is not re-sent on reconnect. Today only native-terminal forwarders (claude-native) stamp a turn id on their status edges; other harnesses leave this `None`.",
+            "title": "Active Response Id"
+          },
           "agent_id": {
             "description": "Durable identifier of the bound agent, e.g. `\"ag_abc123\"`. Stable across renames of the agent.",
             "title": "Agent Id",
@@ -6119,6 +6131,35 @@
         ]
       }
     },
+    "/v1/harnesses": {
+      "get": {
+        "operationId": "list_harnesses_v1_harnesses_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Harnesses V1 Harnesses Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Harnesses",
+        "tags": [
+          "harnesses"
+        ]
+      }
+    },
     "/v1/hosts": {
       "get": {
         "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
@@ -6541,7 +6582,7 @@
     },
     "/v1/me": {
       "get": {
-        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\"}`, `{\"user_id\": null}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
+        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nAlso returns `is_admin` \u2014 the mode-agnostic admin signal\n(the shared `users.is_admin` column, set by the admin-list\npromotion at login). The SPA gates admin chrome on it in\nEVERY mode, including OIDC/SSO where the accounts-only\n`/auth/me` endpoint does not exist.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\", \"is_admin\": true}`, `{\"user_id\": null, \"is_admin\": false}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
         "operationId": "me_v1_me_get",
         "responses": {
           "200": {
