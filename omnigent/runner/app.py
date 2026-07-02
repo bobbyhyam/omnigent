@@ -15579,9 +15579,7 @@ def create_runner_app(
         if body_type == "approval":
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
-            pending_approvals.resolve(
-                _data.get("elicitation_id", ""), _elicit_action == "accept"
-            )
+            pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
             if _elicit_action == "decline":
                 # Explicit user decline: send an interrupt to the harness
                 # so the turn aborts cleanly instead of continuing after
