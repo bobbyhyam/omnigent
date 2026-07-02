@@ -90,6 +90,29 @@ class HarnessCapabilities:
     subagents: bool
 
 
+# SDK/subprocess harnesses whose per-session model override lands in the spawn
+# env (``HARNESS_<H>_MODEL``) — must stay in sync with ``_HARNESS_MODEL_ENV_KEY``
+# in ``omnigent/runner/app.py``. Native harnesses always take the override via
+# ``--model`` at launch, so they are covered by their native metadata rather
+# than this set. This is the source of truth; ``model_override`` re-exports it as
+# ``_SDK_MODEL_OVERRIDE_HARNESSES`` (Phase 1 inversion — the harnesses package
+# owns the data, legacy modules derive from it).
+SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
+    {
+        "claude-sdk",
+        "codex",
+        "pi",
+        "openai-agents",
+        "cursor",
+        "antigravity",
+        "kimi",
+        "qwen",
+        "goose",
+        "copilot",
+    }
+)
+
+
 # Convenience aliases for the dense table below.
 _M = IntegrationMode
 _E = Elicitation

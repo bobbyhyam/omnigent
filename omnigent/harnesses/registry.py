@@ -9,9 +9,8 @@ those constants; the accompanying test
 from __future__ import annotations
 
 from omnigent.harness_aliases import HARNESS_ALIASES
-from omnigent.harnesses.capabilities import capabilities_for
+from omnigent.harnesses.capabilities import SDK_MODEL_OVERRIDE_HARNESSES, capabilities_for
 from omnigent.harnesses.types import HarnessDescriptor
-from omnigent.model_override import harness_supports_model_override
 from omnigent.native_coding_agents import NativeCodingAgent, native_coding_agent_for_harness
 from omnigent.onboarding.harness_install import _HARNESS_NAME_TO_KEY, harness_install_spec
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -89,6 +88,11 @@ def _build_registry() -> dict[str, HarnessDescriptor]:
                 f"omnigent.harnesses.capabilities._CAPABILITIES — declare its "
                 f"capabilities there"
             )
+        # Native CLIs take the override via --model at launch; SDK harnesses via
+        # HARNESS_<H>_MODEL in the spawn env (SDK_MODEL_OVERRIDE_HARNESSES). This
+        # is the same predicate model_override.harness_supports_model_override
+        # encodes — now sourced from the harnesses package (Phase 1 inversion).
+        supports_model_override = native is not None or name in SDK_MODEL_OVERRIDE_HARNESSES
         registry[name] = HarnessDescriptor(
             name=name,
             aliases=_aliases_for(name),
@@ -96,7 +100,7 @@ def _build_registry() -> dict[str, HarnessDescriptor]:
             harness_module=_HARNESS_MODULES.get(name),
             native=native,
             install_family_key=install_family_key,
-            supports_model_override=harness_supports_model_override(name),
+            supports_model_override=supports_model_override,
             capabilities=capabilities,
         )
     return registry

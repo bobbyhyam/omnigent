@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harnesses.capabilities import SDK_MODEL_OVERRIDE_HARNESSES
 
 # Generous-but-safe upper bound; real ids ("databricks-claude-opus-4-8",
 # "us.anthropic.claude-sonnet-4-6") stay well under it.
@@ -25,20 +26,14 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
 
 # SDK harnesses whose model override lands in the spawn env — must stay
 # in sync with ``_HARNESS_MODEL_ENV_KEY`` in ``omnigent/runner/app.py``.
-_SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
-    {
-        "claude-sdk",
-        "codex",
-        "pi",
-        "openai-agents",
-        "cursor",
-        "antigravity",
-        "kimi",
-        "qwen",
-        "goose",
-        "copilot",
-    }
-)
+#
+# The source of truth now lives in the harnesses package
+# (``omnigent.harnesses.capabilities.SDK_MODEL_OVERRIDE_HARNESSES``); this
+# name is kept as a thin re-export so existing callers are unchanged. Imported
+# from the leaf ``capabilities`` module (which imports nothing from omnigent),
+# so there is no import cycle. See designs/harness-modular-registry-proposal.md
+# Phase 1.
+_SDK_MODEL_OVERRIDE_HARNESSES = SDK_MODEL_OVERRIDE_HARNESSES
 
 
 def validate_model_override(value: str) -> str:

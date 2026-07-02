@@ -165,6 +165,21 @@ def test_native_harnesses_resume_warm() -> None:
             assert descriptor.capabilities.resume is Resume.WARM_REATTACH, descriptor.name
 
 
+def test_model_override_set_is_owned_by_harnesses_package() -> None:
+    # Phase 1 inversion: the harnesses package owns the SDK-override set;
+    # model_override re-exports the same object (not a copy).
+    from omnigent.harnesses.capabilities import SDK_MODEL_OVERRIDE_HARNESSES
+    from omnigent.model_override import _SDK_MODEL_OVERRIDE_HARNESSES
+
+    assert _SDK_MODEL_OVERRIDE_HARNESSES is SDK_MODEL_OVERRIDE_HARNESSES
+    # And the registry's derived field agrees with the legacy predicate for every
+    # harness (guards the local re-derivation in registry._build_registry).
+    for descriptor in all_descriptors():
+        assert descriptor.supports_model_override == harness_supports_model_override(
+            descriptor.name
+        )
+
+
 def test_matrix_renders_every_harness() -> None:
     table = render_matrix()
     for descriptor in all_descriptors():
