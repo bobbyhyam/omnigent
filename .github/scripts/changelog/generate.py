@@ -350,7 +350,7 @@ _SEED_CHANGELOG = (
     "# Changelog\n\n"
     "All notable user-facing changes to omnigent are documented here. This file is "
     "generated at release time from each PR's `## Changelog` section, tagged by the "
-    "PR's \"Type of change\" (e.g. `[UI]`); the concise, curated highlights live on "
+    "PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on "
     "the website under `/releases`.\n"
 )
 
