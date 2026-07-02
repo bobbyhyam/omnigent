@@ -82,6 +82,8 @@ def _await_health(base_url: str, log_path: Path) -> None:
             if httpx.get(f"{base_url}/health", timeout=2).status_code == 200:
                 return
         except httpx.HTTPError:
+            # Expected while the server is still booting (connection refused /
+            # reset); keep polling until the deadline.
             pass
         time.sleep(0.5)
     tail = log_path.read_text()[-3000:] if log_path.exists() else "(no log)"

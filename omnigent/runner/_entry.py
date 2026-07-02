@@ -480,6 +480,9 @@ def _make_managed_mint_factory(
         if exc.response.status_code in (400, 404):
             return None
     except (httpx.HTTPError, ValueError, KeyError, OSError):
+        # Transient probe failure (network blip, 5xx, timeout, malformed
+        # response): still install the factory so the next callback re-mints,
+        # per the policy documented above.
         pass
     return _factory
 
