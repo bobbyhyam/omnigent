@@ -50,7 +50,6 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import httpx
 
@@ -74,6 +73,13 @@ _TURN_TIMEOUT_S = 180.0
 # so the prompts stay short and the timeouts generous.
 _STREAM_PROMPT = "Count from 1 to 20 in words, one per line."
 _LONG_PROMPT = "Write a detailed 500-word essay about the history of computing."
+
+# Session SSE event names (confirmed live against claude-native).
+_DELTA_EVENT = "response.output_text.delta"
+_COMPLETED_EVENT = "response.completed"
+_FAILED_EVENT = "response.failed"
+_INTERRUPTED_EVENT = "session.interrupted"
+_TERMINAL_EVENTS = frozenset({_COMPLETED_EVENT, _FAILED_EVENT, _INTERRUPTED_EVENT})
 
 
 @dataclass(frozen=True)
@@ -294,134 +300,117 @@ class NativeTuiDriver:
         ).raise_for_status()
 
     def _drive_turn(self, prompt: str, *, count_deltas: bool = False) -> TurnResult:
-        """Send *prompt*; poll for the assistant reply the forwarder mirrors back.
+        """Send *prompt* and read this turn's outcome from the SSE stream.
 
-        When *count_deltas*, subscribe to the session SSE stream **before**
-        posting (on a background thread) and count ``response.output_text.delta``
-        events — native forwards real per-chunk deltas. Subscribing first is
-        essential: the stream is not replayed, so a subscription opened after
-        the POST misses deltas that already fired (the bug the first live smoke
-        surfaced as a false streaming DRIFT).
+        The turn is driven **entirely from the stream**, not from item
+        polling. This is load-bearing: the driver reuses one session across
+        probes, so polling for "an assistant item" returns a *prior* turn's
+        stale reply and races the current turn (the bug two live smokes
+        surfaced as a false streaming DRIFT — deltas arrive, but the stale
+        item ended the read before they were counted). Subscribing to the
+        stream first, then posting, then reading to ``response.completed``
+        scopes every signal to *this* turn: delta count, delta text, and the
+        terminal state.
         """
         assert self._client is not None
         result = TurnResult()
-        if count_deltas:
-            counter = {"n": 0}
-            done = threading.Event()
-            ready = threading.Event()
-            reader = threading.Thread(
-                target=self._count_stream_deltas, args=(counter, done, ready)
-            )
-            reader.start()
-            ready.wait(timeout=10.0)  # ensure the subscription is open before posting
-            self._post_message(prompt)
-        else:
-            self._post_message(prompt)
-        text = self._poll_assistant_text()
-        if count_deltas:
-            done.set()
-            reader.join(timeout=5.0)
-            result.text_delta_count = counter["n"]
-        if text is None:
+        events: list[str] = []
+        ready = threading.Event()
+
+        def _read() -> None:
+            assert self._client is not None
+            try:
+                with self._client.stream(
+                    "GET", f"/v1/sessions/{self._session_id}/stream", timeout=_TURN_TIMEOUT_S
+                ) as resp:
+                    ready.set()
+                    for line in resp.iter_lines():
+                        if line.startswith("event:"):
+                            events.append(line[len("event:") :].strip())
+                        elif line.startswith("data:") and events and events[-1] == _DELTA_EVENT:
+                            # Accumulate the delta text so result.text reflects
+                            # THIS turn (item polling would read a prior turn).
+                            result.text += _delta_text(line)
+                        if events and events[-1] in _TERMINAL_EVENTS:
+                            return
+            except httpx.HTTPError as exc:
+                result.error = repr(exc)
+
+        reader = threading.Thread(target=_read)
+        reader.start()
+        ready.wait(timeout=10.0)  # subscribe before posting so no delta is lost
+        self._post_message(prompt)
+        reader.join(timeout=_TURN_TIMEOUT_S)
+
+        result.text_delta_count = sum(1 for e in events if e == _DELTA_EVENT)
+        if _COMPLETED_EVENT in events:
+            result.completed = True
+        elif not events:
             result.timed_out = True
-            return result
-        result.completed = True
-        result.text = text
+        else:
+            # Stream ended on failed / no terminal within timeout.
+            result.failed = _FAILED_EVENT in events
+            result.timed_out = not result.failed
         return result
-
-    def _count_stream_deltas(
-        self, counter: dict[str, int], done: threading.Event, ready: threading.Event
-    ) -> None:
-        """Count response.output_text.delta events on the session SSE stream.
-
-        Runs on a background thread: sets *ready* once the stream is open (so
-        the caller posts only after subscribing), increments *counter* per
-        delta, and stops when *done* is set or a terminal event arrives.
-        """
-        assert self._client is not None
-        try:
-            with self._client.stream(
-                "GET", f"/v1/sessions/{self._session_id}/stream", timeout=_TURN_TIMEOUT_S
-            ) as resp:
-                ready.set()
-                for line in resp.iter_lines():
-                    if done.is_set():
-                        break
-                    if not line.startswith("event:"):
-                        continue
-                    etype = line[len("event:") :].strip()
-                    if etype == "response.output_text.delta":
-                        counter["n"] += 1
-                    elif etype in ("response.completed", "response.failed", "session.idle"):
-                        break
-        except httpx.HTTPError:
-            pass
-
-    def _poll_assistant_text(self, timeout: float = _TURN_TIMEOUT_S) -> str | None:
-        """Poll session items until an assistant item appears; return its text."""
-        assert self._client is not None
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            resp = self._client.get(
-                f"/v1/sessions/{self._session_id}/items", params={"order": "asc"}
-            )
-            if resp.status_code == 200:
-                for item in resp.json().get("data", []):
-                    if item.get("role") == "assistant":
-                        text = _assistant_text(item)
-                        if text:
-                            return text
-            time.sleep(_POLL_INTERVAL_S)
-        return None
 
     def _drive_interrupt_turn(self) -> TurnResult:
-        """Start a long turn, interrupt it, and detect the session.interrupted signal.
+        """Start a long turn, interrupt it once text streams, detect the cancel.
 
-        Native cancellation does not persist an "interrupted" user message
-        (unlike full-server); it surfaces as a ``session.interrupted`` SSE
-        event, so this subscribes to the stream, posts the interrupt once the
-        turn is running, and sets ``cancelled`` when that event arrives.
+        Native cancellation surfaces as a ``session.interrupted`` SSE event
+        (no persisted "interrupted" user message, unlike full-server). Like
+        the other turns this subscribes to the stream **before** posting, so
+        it sees the first delta (its cue to fire the interrupt) and the
+        terminal ``session.interrupted``.
         """
         assert self._client is not None
         result = TurnResult()
+        ready = threading.Event()
+
+        def _read() -> None:
+            assert self._client is not None
+            interrupted = False
+            try:
+                with self._client.stream(
+                    "GET", f"/v1/sessions/{self._session_id}/stream", timeout=_TURN_TIMEOUT_S
+                ) as resp:
+                    ready.set()
+                    for line in resp.iter_lines():
+                        if not line.startswith("event:"):
+                            continue
+                        etype = line[len("event:") :].strip()
+                        if etype == _DELTA_EVENT:
+                            result.text_delta_count += 1
+                            if not interrupted:
+                                interrupted = True
+                                self._client.post(
+                                    f"/v1/sessions/{self._session_id}/events",
+                                    json={"type": "interrupt"},
+                                    timeout=15.0,
+                                )
+                        elif etype == _INTERRUPTED_EVENT:
+                            result.cancelled = True
+                            return
+                        elif etype in (_COMPLETED_EVENT, _FAILED_EVENT):
+                            return
+            except httpx.HTTPError as exc:
+                result.error = repr(exc)
+
+        reader = threading.Thread(target=_read)
+        reader.start()
+        ready.wait(timeout=10.0)
         self._post_message(_LONG_PROMPT)
-        interrupted = False
-        try:
-            with self._client.stream(
-                "GET", f"/v1/sessions/{self._session_id}/stream", timeout=_TURN_TIMEOUT_S
-            ) as resp:
-                for line in resp.iter_lines():
-                    if not line.startswith("event:"):
-                        continue
-                    etype = line[len("event:") :].strip()
-                    if etype == "response.output_text.delta":
-                        result.text_delta_count += 1
-                        if not interrupted:
-                            interrupted = True
-                            self._client.post(
-                                f"/v1/sessions/{self._session_id}/events",
-                                json={"type": "interrupt"},
-                                timeout=15.0,
-                            )
-                    elif etype == "session.interrupted":
-                        result.cancelled = True
-                        break
-                    elif etype in ("response.completed", "response.failed", "session.idle"):
-                        break
-        except httpx.HTTPError as exc:
-            result.error = repr(exc)
+        reader.join(timeout=_TURN_TIMEOUT_S)
         return result
 
 
-def _assistant_text(item: dict[str, Any]) -> str:
-    """Concatenate assistant output_text blocks from a session item."""
-    if item.get("role") != "assistant":
+def _delta_text(data_line: str) -> str:
+    """Extract the delta text from a ``data:`` SSE line for an output_text.delta."""
+    import json
+
+    try:
+        payload = json.loads(data_line[len("data:") :].strip())
+    except json.JSONDecodeError:
         return ""
-    content = item.get("content")
-    if not isinstance(content, list):
-        return ""
-    return " ".join(
-        block["text"]
-        for block in content
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    )
+    if isinstance(payload, dict):
+        return str(payload.get("delta", "") or "")
+    return ""
