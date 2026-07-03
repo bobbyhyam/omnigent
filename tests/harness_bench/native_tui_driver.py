@@ -75,12 +75,27 @@ _TURN_TIMEOUT_S = 180.0
 _STREAM_PROMPT = "Count from 1 to 20 in words, one per line."
 _LONG_PROMPT = "Write a detailed 500-word essay about the history of computing."
 
-# Session SSE event names (confirmed live against claude-native).
+# Session SSE event names (confirmed live against claude-native with a
+# per-event diagnostic). Critical native-tui quirk: ``response.completed``
+# fires EARLY — right after the turn is accepted, seconds before the
+# assistant's text deltas — so it marks the orchestration round, not the
+# reply. The real end-of-output is ``response.output_item.done``, which
+# arrives immediately after the final delta. Treating ``response.completed``
+# as terminal makes the SSE reader exit before any delta streams, so every
+# delta is lost (0 counted) and the interrupt probe never sees text to
+# interrupt. The reader therefore stops on ``response.output_item.done``.
 _DELTA_EVENT = "response.output_text.delta"
-_COMPLETED_EVENT = "response.completed"
+_OUTPUT_DONE_EVENT = "response.output_item.done"
+_IN_PROGRESS_EVENT = "response.in_progress"
 _FAILED_EVENT = "response.failed"
 _INTERRUPTED_EVENT = "session.interrupted"
-_TERMINAL_EVENTS = frozenset({_COMPLETED_EVENT, _FAILED_EVENT, _INTERRUPTED_EVENT})
+
+# How long to let a turn run after it reports in-progress before firing the
+# interrupt, so the cancel lands mid-turn rather than racing turn setup.
+_INTERRUPT_HOLD_S = 2.0
+# The reader stops here: output finished, failed, or cancelled. Note the
+# deliberate absence of ``response.completed`` (see above).
+_READER_TERMINAL = frozenset({_OUTPUT_DONE_EVENT, _FAILED_EVENT, _INTERRUPTED_EVENT})
 
 
 @dataclass(frozen=True)
@@ -306,9 +321,13 @@ class NativeTuiDriver:
 
         Two sources, each for what it reliably provides:
 
-        - **Stream** (subscribe-first, background thread): the delta count and
-          the terminal event, scoped to this turn. Subscribing before posting
-          is required — the stream is not replayed.
+        - **Stream** (subscribe-first, background thread): the delta count,
+          scoped to this turn. Subscribing before posting is required — the
+          stream is not replayed. The reader stops on
+          ``response.output_item.done`` (the true end-of-output), NOT on
+          ``response.completed`` — on native-tui that fires seconds early
+          (see ``_READER_TERMINAL``), so stopping there would count zero
+          deltas.
         - **Item poll**: the assistant reply text. A short reply may arrive as
           a single ``response.output_item.done`` with no text deltas, so
           delta-accumulated text is unreliable for basic turns — the persisted
@@ -331,7 +350,7 @@ class NativeTuiDriver:
                     for line in resp.iter_lines():
                         if line.startswith("event:"):
                             events.append(line[len("event:") :].strip())
-                            if events[-1] in _TERMINAL_EVENTS:
+                            if events[-1] in _READER_TERMINAL:
                                 return
             except httpx.HTTPError as exc:
                 result.error = repr(exc)
@@ -342,14 +361,16 @@ class NativeTuiDriver:
         ready.wait(timeout=10.0)  # subscribe before posting so no delta is lost
         self._post_message(prompt)
         text = self._poll_new_assistant_text(baseline)
+        # The item landed, so the turn's output is done; the reader stops on
+        # output_item.done, which coincides with the last delta.
         reader.join(timeout=10.0)
 
         result.text_delta_count = sum(1 for e in events if e == _DELTA_EVENT)
         result.text = text or ""
         if text is not None:
             result.completed = True
-        elif _COMPLETED_EVENT in events:
-            # Terminal reached but no new assistant item surfaced — treat as a
+        elif _OUTPUT_DONE_EVENT in events:
+            # Output finished but no new assistant item surfaced — treat as a
             # completed-but-empty turn rather than a hang.
             result.completed = True
         else:
@@ -388,21 +409,29 @@ class NativeTuiDriver:
         return None
 
     def _drive_interrupt_turn(self) -> TurnResult:
-        """Start a long turn, interrupt it once text streams, detect the cancel.
+        """Start a long turn, interrupt it mid-flight, detect the cancel.
 
         Native cancellation surfaces as a ``session.interrupted`` SSE event
-        (no persisted "interrupted" user message, unlike full-server). Like
-        the other turns this subscribes to the stream **before** posting, so
-        it sees the first delta (its cue to fire the interrupt) and the
-        terminal ``session.interrupted``.
+        (no persisted "interrupted" user message, unlike full-server). The
+        reader subscribes **before** posting so no event is lost; the main
+        thread drives the interrupt timing.
+
+        Why the main thread fires the interrupt (not the reader on first
+        delta): on native-tui the text deltas arrive in a burst at the very
+        *end* of the turn, after seconds of the vendor CLI working. Waiting
+        for a delta to fire the interrupt would leave a fraction of a second
+        before the turn finishes — too late to land mid-turn. The turn is
+        in-flight from ``response.in_progress`` onward, so the reader signals
+        that, and the main thread interrupts after a short hold while the CLI
+        is still working.
         """
         assert self._client is not None
         result = TurnResult()
         ready = threading.Event()
+        in_progress = threading.Event()
 
         def _read() -> None:
             assert self._client is not None
-            interrupted = False
             try:
                 with self._client.stream(
                     "GET", f"/v1/sessions/{self._session_id}/stream", timeout=_TURN_TIMEOUT_S
@@ -412,19 +441,17 @@ class NativeTuiDriver:
                         if not line.startswith("event:"):
                             continue
                         etype = line[len("event:") :].strip()
-                        if etype == _DELTA_EVENT:
+                        if etype == _IN_PROGRESS_EVENT:
+                            in_progress.set()
+                        elif etype == _DELTA_EVENT:
                             result.text_delta_count += 1
-                            if not interrupted:
-                                interrupted = True
-                                self._client.post(
-                                    f"/v1/sessions/{self._session_id}/events",
-                                    json={"type": "interrupt"},
-                                    timeout=15.0,
-                                )
                         elif etype == _INTERRUPTED_EVENT:
                             result.cancelled = True
                             return
-                        elif etype in (_COMPLETED_EVENT, _FAILED_EVENT):
+                        elif etype in (_OUTPUT_DONE_EVENT, _FAILED_EVENT):
+                            # Output finished (or failed) before the interrupt
+                            # landed. Stop on output_item.done, not the early
+                            # response.completed (see _READER_TERMINAL).
                             return
             except httpx.HTTPError as exc:
                 result.error = repr(exc)
@@ -433,6 +460,18 @@ class NativeTuiDriver:
         reader.start()
         ready.wait(timeout=10.0)
         self._post_message(_LONG_PROMPT)
+        # Interrupt once the turn is in flight, after a short hold so it lands
+        # mid-turn (the CLI is working; deltas have not burst yet).
+        if in_progress.wait(timeout=_TURN_TIMEOUT_S):
+            time.sleep(_INTERRUPT_HOLD_S)
+            try:
+                self._client.post(
+                    f"/v1/sessions/{self._session_id}/events",
+                    json={"type": "interrupt"},
+                    timeout=15.0,
+                )
+            except httpx.HTTPError as exc:
+                result.error = repr(exc)
         reader.join(timeout=_TURN_TIMEOUT_S)
         return result
 
