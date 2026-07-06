@@ -103,6 +103,19 @@ export function MembersPage() {
     })();
   }, [refresh]);
 
+  // Plain header/single-user mode: no accounts, no IdP. The /auth/users
+  // endpoint doesn't exist, so skip the fetch entirely.
+  if (info !== "loading" && !info.accounts_enabled && info.login_url === null) {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+        <h1 className="mb-2 text-2xl font-semibold">Members</h1>
+        <p className="text-sm text-muted-foreground">
+          Member management is not available in single-user mode.
+        </p>
+      </div>
+    );
+  }
+
   // Pre-admin-check render: blank loading state. min-h-full so the
   // AppShell's outlet container governs height — we're a child view,
   // not a full-page replacement.
