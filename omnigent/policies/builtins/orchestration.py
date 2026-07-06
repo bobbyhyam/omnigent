@@ -542,7 +542,7 @@ def worktree_guard(
     # write/edit (surfaced via the pi ``tool_call`` hook). Pi uses the same
     # ``path`` argument key as the Omnigent tools, so no Pi-specific arg
     # branch is needed below.
-    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "write", "edit"}
+    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "MultiEdit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
