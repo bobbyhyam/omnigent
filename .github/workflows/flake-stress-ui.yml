@@ -196,7 +196,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-sidecar-bin-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock', 'tests/codex_parity/sidecar/Cargo.toml', 'tests/codex_parity/sidecar/src/main.rs') }}
+          key: codex-parity-sidecar-bin-${{ contains(github.event.pull_request.labels.*.name, 'force-rebuild-sidecar') && github.run_id || 'v1' }}-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up Rust toolchain
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
