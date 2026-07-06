@@ -367,6 +367,98 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> N
     task.add_done_callback(_evict)
 
 
+async def _start_claude_transcript_forwarder_if_needed(
+    session_id: str,
+    bridge_dir: Path,
+    *,
+    start_at_end: bool,
+) -> bool:
+    """
+    Start ``supervise_forwarder`` when no live task is registered for *session_id*.
+
+    Daemon-owned claude-native sessions rely on the runner for transcript
+    forwarding (the CLI sets ``run_transcript_forwarder=False``). If the
+    forwarder task died (runner restart, supervisor crash) while the tmux pane
+    is still live, Chat stays empty while the Terminal tab keeps working.
+
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory to tail.
+    :param start_at_end: Passed to ``supervise_forwarder``; only affects a
+        cold bridge with no persisted cursor.
+    :returns: ``True`` when a new forwarder task was started; ``False`` when
+        one was already live.
+    """
+    incumbent = _AUTO_FORWARDER_TASKS.get(session_id)
+    if incumbent is not None and not incumbent.done():
+        return False
+
+    from omnigent.claude_native_forwarder import supervise_forwarder
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner._entry import _RunnerDatabricksAuth, _make_auth_token_factory
+
+    server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
+    auth_factory = _make_auth_token_factory()
+    auth_token = auth_factory() if auth_factory is not None else None
+    runner_headers = databricks_request_headers(server_url, bearer_token=auth_token)
+    runner_auth = _RunnerDatabricksAuth(auth_factory)
+
+    forwarder_task = asyncio.create_task(
+        supervise_forwarder(
+            base_url=server_url,
+            headers=runner_headers,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=start_at_end,
+            auth=runner_auth,
+        ),
+        name=f"claude-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, forwarder_task)
+    _logger.info(
+        "Started claude transcript forwarder for session %s bridge_dir=%s task=%s",
+        session_id,
+        bridge_dir,
+        forwarder_task.get_name(),
+    )
+    return True
+
+
+async def _ensure_claude_forwarder_for_session(
+    session_id: str,
+    *,
+    server_client: httpx.AsyncClient,
+    resource_registry: SessionResourceRegistry | None,
+) -> None:
+    """
+    Ensure a live transcript forwarder exists for a claude-native session.
+
+    :param session_id: Omnigent session/conversation id.
+    :param server_client: Omnigent server client for bridge-id lookup.
+    :param resource_registry: Session resource registry; ``None`` skips.
+    :returns: None.
+    """
+    if resource_registry is None:
+        return
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is None:
+        return
+    if terminal_registry.get(session_id, "claude", "main") is None:
+        return
+    from omnigent.claude_native_bridge import bridge_dir_for_bridge_id
+
+    bridge_id = await _claude_native_bridge_id_for_session(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
+    await _start_claude_transcript_forwarder_if_needed(
+        session_id,
+        bridge_dir,
+        start_at_end=False,
+    )
+
+
 # Background tasks that re-pop a still-pending cost-budget approval on a
 # terminal client that attaches after the ASK fired. Kept referenced so
 # they aren't garbage-collected before they run.
@@ -5431,7 +5523,6 @@ async def _auto_create_claude_terminal(
     from omnigent.cli_auth import databricks_request_headers
 
     _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
-    _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.claude_native import (
@@ -5723,6 +5814,7 @@ async def _auto_create_claude_terminal(
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
+        python_executable=sys.executable,
         ap_server_url=server_url,
         ap_auth_headers=_runner_headers,
         bundle_dir=bundle_dir,
@@ -5873,26 +5965,14 @@ async def _auto_create_claude_terminal(
     # ``False`` correctly forwards everything from the beginning. This
     # mirrors the CLI client's ``prepared.cold_resumed`` handling in
     # ``claude_native.py``.
-    from omnigent.claude_native_forwarder import supervise_forwarder
-
-    _forwarder_task = asyncio.create_task(
-        supervise_forwarder(
-            base_url=server_url,
-            headers=_runner_headers,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            start_at_end=resume_external_session_id is not None,
-            auth=_runner_auth,
-        ),
-        name=f"claude-forwarder-{session_id}",
-    )
-    _register_auto_forwarder_task(session_id, _forwarder_task)
-    _logger.info(
-        "Auto-created claude terminal + forwarder for session %s; "
-        "forwarder_task=%s elapsed_ms=%.0f",
+    await _start_claude_transcript_forwarder_if_needed(
         session_id,
-        _forwarder_task.get_name(),
+        bridge_dir,
+        start_at_end=resume_external_session_id is not None,
+    )
+    _logger.info(
+        "Auto-created claude terminal + forwarder for session %s; elapsed_ms=%.0f",
+        session_id,
         (time.monotonic() - started_at) * 1000,
     )
     return terminal_view
@@ -15937,6 +16017,11 @@ def create_runner_app(
                         session_id,
                         claude_terminal_id,
                     )
+                    await _ensure_claude_forwarder_for_session(
+                        session_id,
+                        server_client=server_client,
+                        resource_registry=resource_registry,
+                    )
                     return JSONResponse(
                         status_code=200,
                         content=session_resource_view_to_dict(existing),
@@ -16567,6 +16652,12 @@ def create_runner_app(
         if terminal_registry is None:
             return
         if terminal_registry.get(conv_id, terminal_name, "main") is not None:
+            if harness_name == "claude-native":
+                await _ensure_claude_forwarder_for_session(
+                    conv_id,
+                    server_client=server_client,
+                    resource_registry=resource_registry,
+                )
             return  # a pane is still registered — nothing to heal
         _logger.info(
             "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
