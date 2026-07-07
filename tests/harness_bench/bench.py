@@ -1,9 +1,11 @@
 """The bench orchestrator: run probes across harnesses into a matrix.
 
-Sequential by design. Each harness spawns one wrap subprocess with a
-single in-flight turn per conversation, so its probes run one after
-another over a shared driver; harnesses run one at a time to keep the
-subprocess and gateway load bounded.
+Probes *within* a harness are sequential — they share one driver/session with
+a single in-flight turn per conversation. Harnesses run one at a time by
+default (``jobs=1``); ``jobs>1`` runs up to N concurrently, bounded by a
+semaphore, to cut wall-clock while keeping process/gateway load capped. Under a
+parallel run, full-server harnesses share one server+runner (see
+:func:`_maybe_shared_full_server`) rather than each booting their own.
 """
 
 from __future__ import annotations
@@ -167,6 +169,7 @@ async def run_harness(
     live: bool = True,
     transport: str | None = None,
     progress: Progress | ProgressSink | None = None,
+    shared_full_server=None,
 ) -> HarnessReport:
     """Run every applicable probe against one harness.
 
@@ -181,6 +184,11 @@ async def run_harness(
         declared transport when set (see :func:`resolve_driver_class`).
     :param progress: A :class:`ProgressSink` (structured events), a plain
         per-line callback (adapted), or ``None`` (silent).
+    :param shared_full_server: An optional shared
+        :class:`~tests.harness_bench.full_server_driver.SharedFullServer` to
+        register this harness on, instead of the driver spawning its own
+        server+runner. Only used when the resolved driver is the full-server
+        driver; ignored otherwise.
     :returns: The :class:`HarnessReport`.
     """
     probes = probes if probes is not None else ALL_PROBES
@@ -200,7 +208,14 @@ async def run_harness(
     assert databricks_profile is not None  # guaranteed by the unavailable() check
     _emit(sink, HarnessStarted(profile.harness, driver_cls.transport, profile.model))
     cells: list[CellResult] = []
-    driver_cm = driver_cls(profile, databricks_profile=databricks_profile)
+    # Only the full-server driver accepts a shared server; pass it through when
+    # this harness resolved to that transport, else construct plainly.
+    if shared_full_server is not None and driver_cls.transport == "full-server":
+        driver_cm = driver_cls(
+            profile, databricks_profile=databricks_profile, shared=shared_full_server
+        )
+    else:
+        driver_cm = driver_cls(profile, databricks_profile=databricks_profile)
     try:
         entered = await driver_cm.__aenter__()
     except Exception as exc:
@@ -270,40 +285,83 @@ async def run_bench(
         original sequential behavior. ``>1`` runs up to *jobs* harnesses at
         once, bounded by a semaphore. Probes *within* a harness always run
         sequentially — they share one driver/session with a single in-flight
-        turn — so concurrency is only across harnesses. Each harness owns its
-        own server/runner (or wrap subprocess + host daemon), so they do not
-        share transport state; the cap keeps process/port and gateway load
-        bounded rather than spawning every harness at once. Report order
-        always matches *profiles* order regardless of finish order.
+        turn — so concurrency is only across harnesses. Report order always
+        matches *profiles* order regardless of finish order.
+
+        For full-server harnesses under ``jobs`` > 1, one shared server+runner
+        is spawned and every full-server harness registers its own agent +
+        session on it (the runner resolves the harness per session), instead of
+        each harness booting its own server. native-tui harnesses still
+        self-provision (each needs its own host daemon).
     """
-    if jobs <= 1:
-        reports = [
-            await run_harness(
-                p,
-                probes=probes,
-                databricks_profile=databricks_profile,
-                live=live,
-                transport=transport,
-                progress=progress,
-            )
+    async with _maybe_shared_full_server(
+        profiles, databricks_profile=databricks_profile, live=live, transport=transport, jobs=jobs
+    ) as shared:
+        if jobs <= 1:
+            reports = [
+                await run_harness(
+                    p,
+                    probes=probes,
+                    databricks_profile=databricks_profile,
+                    live=live,
+                    transport=transport,
+                    progress=progress,
+                    shared_full_server=shared,
+                )
+                for p in profiles
+            ]
+            return BenchMatrix(reports=reports)
+
+        semaphore = asyncio.Semaphore(jobs)
+
+        async def _one(p: BenchProfile) -> HarnessReport:
+            async with semaphore:
+                return await run_harness(
+                    p,
+                    probes=probes,
+                    databricks_profile=databricks_profile,
+                    live=live,
+                    transport=transport,
+                    progress=progress,
+                    shared_full_server=shared,
+                )
+
+        # gather preserves input order, so the matrix stays in *profiles* order
+        # even though harnesses finish out of order.
+        reports = await asyncio.gather(*(_one(p) for p in profiles))
+        return BenchMatrix(reports=list(reports))
+
+
+@contextlib.asynccontextmanager
+async def _maybe_shared_full_server(
+    profiles: list[BenchProfile],
+    *,
+    databricks_profile: str | None,
+    live: bool,
+    transport: str | None,
+    jobs: int,
+):
+    """Yield a shared full-server for parallel full-server runs, else ``None``.
+
+    Only stands one up when it actually helps: a live, parallel run with more
+    than one harness that resolves to the full-server transport. Otherwise
+    yields ``None`` and each harness provisions as before (a solo full-server
+    run still owns its own server, unchanged).
+    """
+    shared = None
+    if live and jobs > 1 and databricks_profile is not None:
+        full = [
+            p
             for p in profiles
+            if resolve_driver_class(p, override=transport).transport == "full-server"
         ]
-        return BenchMatrix(reports=reports)
+        if len(full) > 1:
+            from tests.harness_bench.full_server_driver import SharedFullServer
 
-    semaphore = asyncio.Semaphore(jobs)
-
-    async def _one(p: BenchProfile) -> HarnessReport:
-        async with semaphore:
-            return await run_harness(
-                p,
-                probes=probes,
-                databricks_profile=databricks_profile,
-                live=live,
-                transport=transport,
-                progress=progress,
-            )
-
-    # gather preserves input order in its result list, so the matrix stays in
-    # *profiles* order even though harnesses finish out of order.
-    reports = await asyncio.gather(*(_one(p) for p in profiles))
-    return BenchMatrix(reports=list(reports))
+            shared = SharedFullServer(databricks_profile)
+            await asyncio.to_thread(shared.__enter__)
+    try:
+        yield shared
+    finally:
+        if shared is not None:
+            await asyncio.to_thread(shared.__exit__, None, None, None)

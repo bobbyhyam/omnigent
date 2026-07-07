@@ -291,6 +291,92 @@ async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -
     assert [r.profile.harness for r in matrix.reports] == ["fake-0", "fake-1", "fake-2"]
 
 
+async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A parallel full-server run builds ONE shared server, reused by every harness.
+
+    Verifies the shared-server optimization: instead of N server+runner boots,
+    one SharedFullServer is entered once and each harness registers its own
+    agent+session on it.
+    """
+    import tests.harness_bench.bench as bench_mod
+    import tests.harness_bench.full_server_driver as fs_mod
+    from tests.harness_bench.driver import TurnResult
+
+    built: list[object] = []
+
+    class _FakeShared:
+        def __init__(self, db_profile: str) -> None:
+            built.append(self)
+            self.registered: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+        def register_agent(self, profile, *, deny: bool) -> str:
+            self.registered.append(profile.harness)
+            return f"bench-{profile.harness}"
+
+        def create_session(self, agent_name: str) -> str:
+            return f"sess-{agent_name}"
+
+    # A full-server driver that records which shared server it was handed.
+    class _FSDriver:
+        transport = "full-server"
+
+        def __init__(self, profile, *, databricks_profile: str, shared=None) -> None:
+            self._profile = profile
+            self._shared = shared
+
+        @staticmethod
+        def unavailable(profile, *, databricks_profile):
+            return None
+
+        async def __aenter__(self):
+            assert self._shared is not None  # parallel run injected the shared server
+            self._shared.register_agent(self._profile, deny=False)
+            self._shared.create_session(f"bench-{self._profile.harness}")
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            pass
+
+        async def run_basic_turn(self, marker: str) -> TurnResult:
+            return TurnResult(completed=True, text=marker)
+
+        async def run_streaming_turn(self) -> TurnResult:
+            return TurnResult(completed=True, text_delta_count=3)
+
+        async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+            return TurnResult(completed=True, tool_call_denied=deny)
+
+        async def run_interrupt_turn(self) -> TurnResult:
+            return TurnResult(cancelled=True)
+
+    monkeypatch.setattr(fs_mod, "SharedFullServer", _FakeShared)
+    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _FSDriver)
+
+    profiles = [
+        BenchProfile(
+            harness=f"fs-{i}",
+            model="m",
+            env_prefix=f"HARNESS_FS{i}_",
+            marker="X",
+            transport="full-server",
+        )
+        for i in range(3)
+    ]
+    matrix = await run_bench(
+        profiles, databricks_profile="oss", live=True, jobs=3, transport="full-server"
+    )
+    # Exactly one shared server, and all three harnesses registered on it.
+    assert len(built) == 1
+    assert sorted(built[0].registered) == ["fs-0", "fs-1", "fs-2"]
+    assert [r.profile.harness for r in matrix.reports] == ["fs-0", "fs-1", "fs-2"]
+
+
 def test_cli_writes_report_file(tmp_path) -> None:
     """`--report PATH` writes the matrix; format follows the extension."""
     from tests.harness_bench.__main__ import main
