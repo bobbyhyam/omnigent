@@ -6,11 +6,14 @@ from omnigent.db.db_models import SqlAgent
 from omnigent.entities import Agent
 
 
-def sql_agent_to_entity(row: SqlAgent) -> Agent:
+def sql_agent_to_entity(row: SqlAgent, session_id: str | None = None) -> Agent:
     """
     Convert a :class:`SqlAgent` ORM row to an :class:`Agent` entity.
 
     :param row: The SQLAlchemy ORM row to convert.
+    :param session_id: Owning conversation id when this agent is
+        session-scoped (derived from ``conversations.agent_id``);
+        ``None`` for template agents.
     :returns: An :class:`Agent` dataclass instance.
     """
     return Agent(
@@ -21,5 +24,5 @@ def sql_agent_to_entity(row: SqlAgent) -> Agent:
         version=row.version,
         description=row.description,
         updated_at=row.updated_at,
-        session_id=row.session_id,
+        session_id=session_id,
     )

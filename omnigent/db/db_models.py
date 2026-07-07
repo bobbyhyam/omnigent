@@ -44,9 +44,6 @@ class SqlAgent(Base):
         purpose. ``None`` when not provided.
     :param updated_at: Unix epoch seconds of the last update, or
         ``None`` if the agent has never been updated.
-    :param session_id: Owning conversation/session id for a
-        session-scoped agent. ``None`` for template agents uploaded
-        through ``POST /api/agents``.
     """
 
     __tablename__ = "agents"
@@ -58,22 +55,14 @@ class SqlAgent(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    session_id: Mapped[str | None] = mapped_column(
-        String(64),
-        ForeignKey("conversations.id", ondelete="CASCADE"),
-        nullable=True,
-    )
 
     __table_args__ = (
         Index("ix_agents_created_at", "created_at"),
-        Index(
-            "ix_agents_template_name",
-            "name",
-            unique=True,
-            sqlite_where=text("session_id IS NULL"),
-            postgresql_where=text("session_id IS NULL"),
-        ),
-        Index("ix_agents_session_id", "session_id", unique=True),
+        # Template agents have unique names. Session-scoped agents
+        # (referenced by conversations.agent_id) may reuse the same
+        # name across sessions; uniqueness is enforced only for the
+        # built-in template set.
+        Index("ix_agents_template_name", "name", unique=True),
     )
 
 

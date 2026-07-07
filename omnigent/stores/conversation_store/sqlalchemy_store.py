@@ -193,7 +193,6 @@ def _new_session_agent_row(
     agent_name: str,
     agent_bundle_location: str,
     agent_description: str | None,
-    conversation_id: str,
     now: int,
 ) -> SqlAgent:
     """
@@ -203,7 +202,6 @@ def _new_session_agent_row(
     :param agent_name: Agent name loaded from the uploaded spec.
     :param agent_bundle_location: Artifact-store key for the bundle.
     :param agent_description: Optional description from the spec.
-    :param conversation_id: Owning conversation id.
     :param now: Unix epoch seconds used for the created field.
     :returns: Unsaved :class:`SqlAgent` row.
     """
@@ -214,7 +212,6 @@ def _new_session_agent_row(
         bundle_location=agent_bundle_location,
         version=1,
         description=agent_description,
-        session_id=conversation_id,
     )
 
 
@@ -236,7 +233,7 @@ def _created_session_from_rows(
             conversation_row,
             labels if labels is not None else {},
         ),
-        agent=sql_agent_to_entity(agent_row),
+        agent=sql_agent_to_entity(agent_row, session_id=conversation_row.id),
     )
 
 
@@ -2250,7 +2247,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_name=agent_name,
                 agent_bundle_location=agent_bundle_location,
                 agent_description=agent_description,
-                conversation_id=conversation_id,
                 now=now,
             )
             session.add(agent_row)
@@ -2494,9 +2490,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             # Create/bind the fork's session-scoped agent atomically.
             if creating_clone:
-                # Mint the clone here so it's born with session_id set (never
-                # NULL) and rolls back with the fork on failure — never
-                # leaking as a phantom built-in.
+                # Mint the clone atomically with the fork so it rolls back
+                # with the fork on failure — never leaking as a phantom built-in.
                 assert (
                     agent_id is not None
                     and cloned_agent_name is not None
@@ -2508,16 +2503,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         agent_name=cloned_agent_name,
                         agent_bundle_location=cloned_agent_bundle_location,
                         agent_description=cloned_agent_description,
-                        conversation_id=new_conv.id,
                         now=now,
                     )
                 )
                 session.flush()
                 new_conv.agent_id = agent_id
             elif agent_id is not None:
-                agent_row = session.get(SqlAgent, agent_id)
-                if agent_row is not None:
-                    agent_row.session_id = new_conv.id
+                # Binding an existing (template) agent to the fork: the forward
+                # pointer conversations.agent_id is the sole link; no back-pointer
+                # to update.
+                new_conv.agent_id = agent_id
 
             # Copy labels from the source conversation, minus the
             # instance-scoped ones (native bridge ids, context metrics)
@@ -2617,22 +2612,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
 
-            # Replace the session-scoped agent. Ordering matters for two
-            # constraints: (1) ``conversations.agent_id`` → ``agents.id`` is
-            # ON DELETE CASCADE, so deleting the old agent while the row still
-            # references it would cascade-delete the WHOLE conversation; null
-            # the reference first. (2) ``ix_agents_session_id`` is UNIQUE, so
-            # the old agent must be gone before the new one claims
-            # ``session_id``. Hence: null agent_id → delete old → insert new →
-            # repoint agent_id. The delete is guarded on
-            # ``session_id == conversation_id`` so a (mistakenly bound)
-            # built-in agent is never deleted.
+            # Replace the session-scoped agent. Null the forward pointer first:
+            # conversations.agent_id is ON DELETE CASCADE, so deleting the old
+            # agent row while it is still referenced would cascade-delete the
+            # whole conversation. After the flush the old agent has no
+            # conversation referencing it; if it is still unreferenced by any
+            # other conversation it was session-scoped to this one and is safe
+            # to delete. Template / built-in agents will still appear in other
+            # conversations and are left alone.
             old_agent_id = row.agent_id
             row.agent_id = None
             session.flush()
             if old_agent_id is not None:
                 old_agent = session.get(SqlAgent, old_agent_id)
-                if old_agent is not None and old_agent.session_id == conversation_id:
+                still_referenced = (
+                    old_agent is not None
+                    and session.query(SqlConversation)
+                    .filter(SqlConversation.agent_id == old_agent_id)
+                    .limit(1)
+                    .count()
+                    > 0
+                )
+                if old_agent is not None and not still_referenced:
                     session.delete(old_agent)
                     session.flush()
 
@@ -2641,7 +2642,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_name=new_agent_name,
                 agent_bundle_location=new_agent_bundle_location,
                 agent_description=new_agent_description,
-                conversation_id=conversation_id,
                 now=now,
             )
             session.add(new_agent)

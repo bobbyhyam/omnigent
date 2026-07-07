@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy.sql import exists
 
 from omnigent.db.converters import sql_agent_to_entity
-from omnigent.db.db_models import SqlAgent
+from omnigent.db.db_models import SqlAgent, SqlConversation
 from omnigent.db.utils import (
     get_or_create_engine,
     make_managed_session_maker,
@@ -78,11 +79,22 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         with self._session() as session:
             row = session.get(SqlAgent, agent_id)
-            return sql_agent_to_entity(row) if row else None
+            if row is None:
+                return None
+            # Derive session_id from the forward pointer: an agent is
+            # session-scoped if exactly one conversation references it.
+            session_id = session.execute(
+                select(SqlConversation.id).where(SqlConversation.agent_id == agent_id).limit(1)
+            ).scalar_one_or_none()
+            return sql_agent_to_entity(row, session_id=session_id)
 
     def get_by_name(self, name: str) -> Agent | None:
         """
         Look up a registered template agent by its unique name.
+
+        Template agents are those not referenced by any conversation row
+        via ``conversations.agent_id``. Session-scoped agents (copies
+        bound to a specific conversation) are excluded.
 
         :param name: The template agent's unique name,
             e.g. ``"code-assistant"``.
@@ -92,7 +104,9 @@ class SqlAlchemyAgentStore(AgentStore):
             row = session.execute(
                 select(SqlAgent).where(
                     SqlAgent.name == name,
-                    SqlAgent.session_id.is_(None),
+                    ~exists(
+                        select(SqlConversation.id).where(SqlConversation.agent_id == SqlAgent.id)
+                    ),
                 )
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
@@ -107,6 +121,10 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         List registered template agents with cursor-based pagination.
 
+        Template agents are those not referenced by any conversation row
+        via ``conversations.agent_id``. Session-scoped agents (copies
+        bound to a specific conversation) are excluded.
+
         :param limit: Maximum number of agents to return.
         :param after: Cursor agent ID; return agents appearing
             after this agent in sort order,
@@ -119,12 +137,17 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            template_agent = SqlAgent.session_id.is_(None)
-            stmt = select(SqlAgent).where(template_agent)
+            # An agent is a template if no conversation row references it via
+            # conversations.agent_id. This replaces the old session_id IS NULL
+            # filter now that the back-pointer column has been removed.
+            not_session_scoped = ~exists(
+                select(SqlConversation.id).where(SqlConversation.agent_id == SqlAgent.id)
+            )
+            stmt = select(SqlAgent).where(not_session_scoped)
             if after:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == after, template_agent)
+                    .where(SqlAgent.id == after, not_session_scoped)
                     .scalar_subquery()
                 )
                 # "after" = further in sort direction
@@ -134,7 +157,7 @@ class SqlAlchemyAgentStore(AgentStore):
             if before:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == before, template_agent)
+                    .where(SqlAgent.id == before, not_session_scoped)
                     .scalar_subquery()
                 )
                 # "before" = opposite of sort direction
