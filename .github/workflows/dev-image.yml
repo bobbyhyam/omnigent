@@ -1,7 +1,9 @@
 # Fork-only workflow (bobbyhyam/omnigent). Builds + pushes the Omnigent
-# SERVER image to our fork's GHCR package on every push to a dev/* branch
-# (and on manual dispatch), so the homelab `omnigent-dev` stack can pin a
-# fork-built image to test upstream fix branches before we PR them upstream.
+# SERVER image to our fork's GHCR package on every push to `main` and to a
+# dev/* branch (and on manual dispatch), so the homelab `omnigent-dev` stack
+# can pin a fork-built image: `main` tracks current upstream (kept in sync by
+# the omni-ops #40 fork-sync timer), dev/* carries fix branches we test before
+# PRing them upstream.
 #
 #   ghcr.io/bobbyhyam/omnigent:sha-<short>   immutable per-commit pin
 #
@@ -25,6 +27,11 @@ name: Build dev server image (fork)
 on:
   push:
     branches:
+      # main: the fork-sync timer (omni-ops #40) force-pushes main = upstream
+      # main + this fork CI each day, so a current sha-<short> image always
+      # exists for the omnigent-dev stack to pin without a manual dispatch.
+      - main
+      # dev/**: fix branches under test before we PR them upstream.
       - 'dev/**'
   workflow_dispatch:
 
