@@ -60,16 +60,19 @@ def test_ui_font_family_applies_and_persists(page: Page, seeded_session: tuple[s
     assert _ui_font_family(page) == "", "fresh load should apply no family override"
 
     # → "Georgia": the field, the applied property, and storage all move together.
+    # The applied value leads with the chosen family and appends the system stack
+    # (so an uninstalled/partial name degrades to the default sans, not serif), so
+    # the resolved custom property starts with — rather than equals — "Georgia".
     value.fill("Georgia")
     expect(value).to_have_value("Georgia")
     assert _stored_family(page) == '"Georgia"', "the typed family was not persisted"
-    assert _ui_font_family(page) == "Georgia", "root family did not track the typed name"
+    assert _ui_font_family(page).startswith("Georgia"), "root family did not track the typed name"
 
     # The choice survives a full reload (persisted + re-applied before paint).
     page.reload()
     expect(page.get_by_role("group", name="Font family")).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("ui-font-family-input")).to_have_value("Georgia")
-    assert _ui_font_family(page) == "Georgia", "family was not restored after reload"
+    assert _ui_font_family(page).startswith("Georgia"), "family was not restored after reload"
 
 
 def test_ui_font_family_reset_restores_system_default(
@@ -86,9 +89,10 @@ def test_ui_font_family_reset_restores_system_default(
     value = page.get_by_test_id("ui-font-family-input")
     reset = page.get_by_test_id("ui-font-family-reset")
 
-    # The seeded family renders and is applied to the root.
+    # The seeded family renders and is applied to the root (leading the appended
+    # system-stack fallback, so the resolved value starts with "Georgia").
     expect(value).to_have_value("Georgia")
-    assert _ui_font_family(page) == "Georgia"
+    assert _ui_font_family(page).startswith("Georgia")
 
     # → Reset: the field clears, the override is removed, and the key is cleared.
     reset.click()
