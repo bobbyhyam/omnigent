@@ -153,8 +153,11 @@ describe("SettingsPage", () => {
     expect(input.value).toBe("Inter");
     // The choice is persisted so it survives a refresh...
     expect(localStorage.getItem("omnigent:ui-font-family")).toBe(JSON.stringify("Inter"));
-    // ...and applied live to the document root.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("Inter");
+    // ...and applied live to the document root, with the system stack appended
+    // so an uninstalled/partial name degrades to the default sans, not serif.
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
+      "Inter, var(--font-sans)",
+    );
     expect(screen.getByTestId("ui-font-family-reset")).not.toBeDisabled();
   });
 

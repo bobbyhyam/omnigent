@@ -148,10 +148,16 @@ export function writeUiFontFamily(name: string): void {
 
 /**
  * Apply the given family to the DOM by setting the `--ui-font-family` variable
- * on the document root; the `html` rule in index.css reads it with a
- * `var(--ui-font-family, var(--font-sans))` fallback, so the whole inherited UI
- * re-fonts. An empty name removes the property, restoring the system stack. This
- * is the single source of the DOM side-effect.
+ * on the document root; the `html` rule in index.css reads it as the whole UI's
+ * font. An empty name removes the property, restoring the system stack.
+ *
+ * The chosen family is applied WITH the system stack appended
+ * (`<name>, var(--font-sans)`) so a name that isn't installed — or a partial one
+ * typed so far — degrades to the app's default sans rather than the browser's
+ * default serif. (The `var(--ui-font-family, …)` fallback in the CSS only fires
+ * when the property is unset, not when it holds an unusable name, so the
+ * fallback has to live inside the value too.) This is the single source of the
+ * DOM side-effect.
  */
 export function applyUiFontFamily(name: string): void {
   if (typeof document === "undefined") return;
@@ -160,5 +166,5 @@ export function applyUiFontFamily(name: string): void {
     document.documentElement.style.removeProperty("--ui-font-family");
     return;
   }
-  document.documentElement.style.setProperty("--ui-font-family", normalized);
+  document.documentElement.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
 }

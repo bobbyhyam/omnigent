@@ -129,14 +129,20 @@ describe("uiFontPreferences — family", () => {
     expect(readUiFontFamily()).toBe(UI_FONT_FAMILY_DEFAULT);
   });
 
-  it("applies the family as a custom property on the document root", () => {
+  it("applies the family with the system stack appended as a fallback", () => {
+    // The system stack is appended so an uninstalled/partial name degrades to
+    // the app's default sans, not the browser's default serif.
     applyUiFontFamily("Inter");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("Inter");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
+      "Inter, var(--font-sans)",
+    );
   });
 
   it("removes the custom property when applied empty (System default)", () => {
     applyUiFontFamily("Inter");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("Inter");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
+      "Inter, var(--font-sans)",
+    );
     applyUiFontFamily("");
     // Removing the property lets the html rule fall back to var(--font-sans).
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
