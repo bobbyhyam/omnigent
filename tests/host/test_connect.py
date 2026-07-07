@@ -2201,7 +2201,7 @@ async def test_connected_host_retries_login_redirects_indefinitely(
     [
         (401, "HTTP 401"),
         (403, "HTTP 403"),
-        (404, "permanent"),
+        (400, "permanent"),
     ],
 )
 async def test_run_fails_loud_on_permanent_4xx(
@@ -2209,9 +2209,12 @@ async def test_run_fails_loud_on_permanent_4xx(
 ) -> None:
     """A permanent 4xx upgrade rejection fails loud on the first attempt.
 
-    401/403/other-4xx mean unauthenticated / unauthorized / wrong-or-old
-    server — reconnecting can never succeed, so run() must raise
-    HostConnectError immediately rather than backing off.
+    401/403/other-4xx (e.g. 400) mean unauthenticated / unauthorized /
+    wrong-or-old server — reconnecting can never succeed, so run() must
+    raise HostConnectError immediately rather than backing off. 404 is
+    deliberately excluded: it is transient during a server restart (a
+    reverse proxy answers 404 while the backend is down) and has its own
+    retry-then-fail-loud tests below.
     """
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
@@ -2255,13 +2258,15 @@ async def test_auth_rejection_suggests_omnigent_login(
 async def test_non_auth_permanent_4xx_omits_login_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-auth permanent 4xx (404) does NOT suggest ``omnigent login``.
+    """A non-auth permanent 4xx (400) does NOT suggest ``omnigent login``.
 
     The login remedy is specific to credential/authorization failures;
-    surfacing it on a 404 ("wrong URL / route missing") would misdirect
-    the user. This pins the hint to the 401/403 paths only.
+    surfacing it on a generic permanent 4xx ("wrong URL / bad request")
+    would misdirect the user. This pins the hint to the 401/403 paths
+    only. (404 is no longer permanent; its own fatal message, asserted in
+    the grace-window test below, likewise omits the login hint.)
     """
-    spy = _ConnectSpy([_invalid_status(404)])
+    spy = _ConnectSpy([_invalid_status(400)])
     _patch_connect(monkeypatch, spy)
     host = _host()
 
@@ -2269,20 +2274,20 @@ async def test_non_auth_permanent_4xx_omits_login_hint(
         await host.run()
 
     message = str(excinfo.value)
-    # Confirm we got the actual 404 fatal message (not some unrelated
+    # Confirm we got the actual 400 fatal message (not some unrelated
     # error that happens to lack "login") before asserting the absence.
-    assert "HTTP 404" in message
+    assert "HTTP 400" in message
     assert "omnigent login" not in message
 
 
-@pytest.mark.parametrize("status", [408, 429, 500, 503])
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 503])
 async def test_run_reconnects_on_transient_upgrade_failure(
     monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
     """Transient upgrade failures reconnect instead of failing loud.
 
-    Retryable 4xx (408/429) and any 5xx are transient (server bounce,
-    rate limit) and must stay on the reconnect path. A clean
+    Retryable 4xx (408/425/429) and any 5xx are transient (server
+    bounce, rate limit) and must stay on the reconnect path. A clean
     ``CancelledError`` on the second attempt ends the loop so the test
     terminates; with backoff zeroed the retry is immediate.
     """
@@ -2299,6 +2304,128 @@ async def test_run_reconnects_on_transient_upgrade_failure(
 
     # 2 = transient attempt + cancel attempt → it genuinely reconnected.
     assert spy.call_count == 2
+
+
+async def test_connected_host_rides_out_404_restart_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that already connected retries 404s indefinitely.
+
+    This is the #2039 fix. A reverse proxy in front of the server answers
+    404 for the tunnel route while the backend container restarts (deploy,
+    config change, nightly backup window). A host that has already
+    completed an upgrade is watching a routine restart — killing it would
+    drop its live runners — so it must ride the 404 window out past the
+    never-connected grace window and reconnect when the backend returns.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    # Tiny grace so a *never-connected* host would fail fast — proving the
+    # indefinite retry here is due to _ever_connected, not a long window.
+    monkeypatch.setattr("omnigent.host.connect._UNCONNECTED_TRANSIENT_404_GRACE_S", 0.0)
+    not_found = _invalid_status(404)
+    # Accepted upgrade first (None), then a burst of 404s (the restart
+    # window), then another accepted upgrade, then a cancel to end.
+    spy = _ConnectSpy([None, not_found, not_found, not_found, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: if the post-connect 404s were misclassified as
+    # fatal this would raise HostConnectError after the first 404 (the
+    # zeroed grace window) instead of reconnecting.
+    await host.run()
+
+    # 6 = accepted connect + 3 ridden-out 404s + reconnect + ending
+    # cancel. Fewer means the host died mid-restart (the #2039 bug).
+    assert spy.call_count == 6
+
+
+async def test_fresh_host_retries_404_within_grace_then_connects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-connected host absorbs a transient 404 during startup.
+
+    A host booting while the server is mid-restart may hit a 404 before it
+    ever connects. Within the grace window it must retry rather than fail
+    loud, so a host that starts a few seconds ahead of its server still
+    comes up on its own.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    not_found = _invalid_status(404)
+    # Two 404s inside the (default, generous) grace window, then an
+    # accepted upgrade, then a cancel to end the loop.
+    spy = _ConnectSpy([not_found, not_found, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: the 404s were retried and the accepted upgrade
+    # brought the host up. A raise here would mean a startup-race 404
+    # killed a host that would have connected a beat later.
+    await host.run()
+
+    # 4 = two retried 404s + accepted connect + ending cancel.
+    assert spy.call_count == 4
+
+
+async def test_fresh_host_fails_loud_after_404_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-connected host stops retrying 404 once the grace elapses.
+
+    A 404 that never clears on a host that has never connected is a
+    genuinely wrong server URL, or a server too old to expose the tunnel
+    route — not a restart blip. Once the grace window elapses the host
+    must fail loud (→ exit 1 with the cause printed) instead of looping
+    silently forever. The first 404 of the streak is always retried, so a
+    one-off blip is still absorbed even with the window zeroed.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._UNCONNECTED_TRANSIENT_404_GRACE_S", 0.0)
+    # A single queued 404 repeats forever — the streak only ends because
+    # the host gives up after the grace window.
+    spy = _ConnectSpy([_invalid_status(404)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError) as excinfo:
+        await host.run()
+
+    message = str(excinfo.value)
+    # The fatal message names the 404 cause and the tunnel route, and —
+    # unlike 401/403 — does NOT suggest `omnigent login` (a 404 is not an
+    # auth failure).
+    assert "HTTP 404" in message
+    assert "host tunnel route" in message
+    assert "omnigent login" not in message
+    # 2 = first 404 always retried + second 404 past the zeroed grace →
+    # fatal. 1 would mean the one-off-blip tolerance regressed; more (or
+    # no raise) would mean the fail-loud threshold is broken.
+    assert spy.call_count == 2
+
+
+async def test_ownership_conflict_409_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 409 ownership conflict stays fatal on the first attempt.
+
+    409 means this machine is already registered to a different account
+    (#864/#865): reconnecting can never succeed, so run() must raise
+    HostConnectError immediately with the ownership-conflict remedy rather
+    than retrying. This pins that the 404 change did not disturb the
+    neighbouring 409 handling.
+    """
+    spy = _ConnectSpy([_invalid_status(409)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError) as excinfo:
+        await host.run()
+
+    message = str(excinfo.value)
+    assert "HTTP 409" in message
+    assert "already" in message
+    # Exactly one attempt — no silent reconnect/backoff on an ownership
+    # conflict.
+    assert spy.call_count == 1
 
 
 def test_run_host_process_exits_nonzero_on_fatal(

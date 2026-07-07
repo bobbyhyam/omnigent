@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -425,12 +426,14 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
 # their runners need; everything unnamed stays behind the allowlist.
 RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
 
-# HTTP statuses on the WebSocket upgrade that are worth retrying. Everything
-# else in the 4xx range is a permanent client error (auth, authorization,
-# wrong/old server) where reconnecting can never succeed — those fail loud.
-# 408 (Request Timeout) and 429 (Too Many Requests) are transient by HTTP
-# semantics, so they stay in the reconnect path.
-_RETRYABLE_UPGRADE_STATUSES: frozenset[int] = frozenset({408, 429})
+# HTTP statuses on the WebSocket upgrade that are ALWAYS worth retrying: they
+# are transient by HTTP semantics no matter the connection history — 408
+# (Request Timeout), 425 (Too Early), and 429 (Too Many Requests). A 404 is
+# handled separately (see :meth:`HostProcess._classify_transient_404`) because
+# it is transient only while the server restarts behind a reverse proxy. Every
+# other 4xx is a permanent client error (auth, authorization, wrong/old server)
+# where reconnecting can never succeed — those fail loud.
+_RETRYABLE_UPGRADE_STATUSES: frozenset[int] = frozenset({408, 425, 429})
 
 # Consecutive login-page redirects tolerated on a host that has NEVER
 # completed a WS upgrade in this process. A single redirect can be a server
@@ -441,6 +444,16 @@ _RETRYABLE_UPGRADE_STATUSES: frozenset[int] = frozenset({408, 429})
 # HAS connected keeps retrying indefinitely, so a deploy restart never
 # kills a live host with running sessions.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
+
+# Grace window during which a 404 on the tunnel upgrade is retried on a host
+# that has NEVER completed an upgrade in this process. A reverse proxy in front
+# of a restarting server answers 404 for the tunnel route until the backend is
+# back; a host that has already connected rides that out indefinitely (see
+# :meth:`HostProcess._classify_transient_404`), while a never-connected host
+# retries only until this window elapses and then fails loud — so a genuinely
+# wrong server URL, or a server too old to expose the tunnel route, still
+# surfaces instead of looping silently forever. Measured on the monotonic clock.
+_UNCONNECTED_TRANSIENT_404_GRACE_S = 180.0
 
 
 class HostConnectError(Exception):
@@ -617,6 +630,9 @@ class HostProcess:
         self._ever_connected = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
+        # Monotonic timestamp of the first 404 in the current never-connected
+        # streak; ``None`` when not mid-streak. Reset by a successful upgrade.
+        self._transient_404_since: float | None = None
         # Live tunnel connection, set by _serve_frames for the watcher
         # tasks (which outlive any single connection) to report on.
         self._ws: websockets.asyncio.client.ClientConnection | None = None
@@ -950,11 +966,15 @@ class HostProcess:
             ``403``.
         :returns: A :class:`HostConnectError` for a permanent 4xx, or
             ``None`` for a transient status (retryable 4xx in
-            :data:`_RETRYABLE_UPGRADE_STATUSES`, or any non-4xx such as a
-            5xx server bounce) that the reconnect loop should retry.
+            :data:`_RETRYABLE_UPGRADE_STATUSES`, a 404 still within the
+            restart grace window per :meth:`_classify_transient_404`, or any
+            non-4xx such as a 5xx server bounce) that the reconnect loop
+            should retry.
         """
         if status in _RETRYABLE_UPGRADE_STATUSES or not (400 <= status < 500):
             return None
+        if status == 404:
+            return self._classify_transient_404()
         if status == 401:
             return HostConnectError(
                 "Authentication failed (HTTP 401): the server rejected the "
@@ -987,6 +1007,42 @@ class HostProcess:
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
             "Check the server URL and your access."
+        )
+
+    def _classify_transient_404(self) -> HostConnectError | None:
+        """Treat a 404 on the tunnel upgrade as a transient restart blip.
+
+        A reverse proxy in front of the server answers 404 for the tunnel
+        route while the backend container restarts (upgrade, config change,
+        agent re-seed). A host that has already completed an upgrade in this
+        process rides that window out indefinitely, so a routine server bounce
+        never tears down its live runner sessions. A host that has never
+        connected retries only until
+        :data:`_UNCONNECTED_TRANSIENT_404_GRACE_S` elapses and then fails loud,
+        so a genuinely wrong server URL — or a server too old to expose the
+        tunnel route — still surfaces instead of looping silently forever.
+        The first 404 of a streak is always retried, so a one-off blip is
+        absorbed even when the grace window is short.
+
+        :returns: ``None`` while the 404 should be retried, or a
+            :class:`HostConnectError` once a never-connected host has
+            exhausted the grace window.
+        """
+        if self._ever_connected:
+            return None
+        now = time.monotonic()
+        if self._transient_404_since is None:
+            self._transient_404_since = now
+            return None
+        if now - self._transient_404_since < _UNCONNECTED_TRANSIENT_404_GRACE_S:
+            return None
+        waited = int(now - self._transient_404_since)
+        return HostConnectError(
+            f"Connection refused (HTTP 404): the server did not expose the "
+            f"host tunnel route for {waited}s. If the server is mid-restart "
+            "this clears on its own; otherwise the server URL is wrong or the "
+            "server predates the host API (the /v1/hosts tunnel route). Check "
+            "the URL and that the server is up to date, then retry."
         )
 
     async def _handle_launch(
@@ -1671,6 +1727,7 @@ class HostProcess:
         # from here on are server restarts, not an unauthenticated host.
         self._ever_connected = True
         self._login_redirect_streak = 0
+        self._transient_404_since = None
         try:
             await self._serve_frames(ws)
         finally:
