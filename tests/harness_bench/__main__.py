@@ -8,8 +8,13 @@ Examples::
     # Dry (offline) render — declared matrix, no turns, no creds.
     python -m tests.harness_bench
 
-    # Live probe one harness against a gateway profile.
+    # Live probe one harness against a gateway profile (SDK → full-server,
+    # the default: covers Tool calling + Policy DENY).
     python -m tests.harness_bench --harness codex --profile my-profile
+
+    # Quicker run: SDK harnesses on sdk-inproc (skips the server boot; no
+    # Tool calling / Policy DENY coverage).
+    python -m tests.harness_bench --harness codex --profile my-profile --fast
 
     # Live probe all official harnesses, JSON out.
     python -m tests.harness_bench --profile my-profile --json
@@ -29,7 +34,7 @@ from tests.harness_bench.events import LineSink
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
 from tests.harness_bench.profile import BenchProfile, resolve_profile
 from tests.harness_bench.report import render_json, render_markdown, render_table
-from tests.harness_bench.transport import driver_registry
+from tests.harness_bench.transport import driver_registry, resolve_transport_name
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -65,13 +70,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_false",
         help="Force the offline (declared-only) render.",
     )
-    parser.add_argument(
+    transport_grp = parser.add_mutually_exclusive_group()
+    transport_grp.add_argument(
         "--transport",
         metavar="NAME",
         default=None,
         help="Transport driver override (e.g. 'sdk-inproc', 'full-server'). "
-        "Wins over each profile's declared transport. Defaults to the "
-        "profile's transport.",
+        "Wins over the family default. By default SDK harnesses run on "
+        "full-server (fullest coverage: Tool calling + Policy DENY); natives "
+        "run on native-tui.",
+    )
+    transport_grp.add_argument(
+        "--fast",
+        action="store_true",
+        help="Run SDK harnesses on sdk-inproc instead of the full-server "
+        "default: skips the server boot for a quicker run, at the cost of the "
+        "Tool calling + Policy DENY dimensions (reported SKIPPED). No effect on "
+        "native harnesses. Mutually exclusive with --transport.",
     )
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument(
@@ -128,8 +143,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
     if args.list:
+        # Show the transport a default run would pick (SDK family → full-server),
+        # not the raw family marker, so --list matches what actually runs.
         for name, profile in sorted(OFFICIAL_PROFILES.items()):
-            print(f"{name}\t{profile.transport}\t{profile.model}")
+            transport = resolve_transport_name(profile, override=None, fast=False)
+            print(f"{name}\t{transport}\t{profile.model}")
         return 0
 
     try:
@@ -170,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             databricks_profile=args.profile,
             live=live,
             transport=args.transport,
+            fast=args.fast,
             progress=sink,
             jobs=args.jobs,
         )

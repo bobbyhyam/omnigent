@@ -247,8 +247,10 @@ class StreamingProbe(CapabilityProbe):
 
 ## Transport drivers: the real ceiling on "all dimensions"
 
-Behavioral probes run through a **transport driver** selected per run
-(`--transport`) or from each profile's declared transport. A probe calls
+Behavioral probes run through a **transport driver** resolved from the
+harness *family* plus flags: SDK harnesses default to `full-server` (`--fast`
+picks `sdk-inproc`), natives use `native-tui`, and `--transport NAME` overrides
+the family for any harness. A probe calls
 *semantic* methods on the driver (`run_basic_turn`, `run_streaming_turn`,
 `run_tool_turn(deny=...)`, `run_interrupt_turn`); the driver owns the
 *mechanism* and the probe owns the *interpretation*, so one probe runs across
@@ -277,7 +279,7 @@ The MVP and most of phase-2 are landed. What exists on `main` today:
   `misc` pytest group), and the six P0 live probes (basic turn, streaming,
   tool calling, policy DENY, model override, interrupt) with the `DRIFT`
   column.
-- **Three transport drivers**, selectable via `--transport`:
+- **Three transport drivers**, selected by harness *family* with flag overrides:
   - `sdk-inproc` — drives a harness wrap subprocess directly (the four P0 SDK
     harnesses: claude-sdk, codex, pi, openai-agents).
   - `full-server` — a real server + runner; the only transport that exercises
@@ -285,6 +287,14 @@ The MVP and most of phase-2 are landed. What exists on `main` today:
     calls (SDK harnesses only — it registers via an agent bundle).
   - `native-tui` — a resident vendor CLI in a runner-owned tmux pane, driven
     over the session HTTP surface via a host daemon.
+
+  SDK harnesses default to **`full-server`** — the fullest coverage, and a
+  strict superset of what `sdk-inproc` observes (everything sdk-inproc does,
+  *plus* Tool calling + Policy DENY). `--fast` opts the SDK family down to
+  `sdk-inproc` when you want to skip the server boot (those two dimensions then
+  report `·`). Native harnesses have a single transport `--fast` does not touch.
+  An explicit `--transport NAME` overrides the family default for any harness
+  and is mutually exclusive with `--fast`.
 - **Capability-derived matrix** — descriptive columns and declared verdicts
   come from `harness_capabilities()` (the seam; see
   `designs/harness-capabilities-bench-seam.md`), so a harness added to the
@@ -372,35 +382,37 @@ stream, the bench flags a real drift on the next run, rather than a false
 ## Which transport exercises which dimension
 
 Not every dimension is observable on every transport, so a `·` (SKIPPED) in a
-default run often means "this transport can't exercise it here," not "the
-harness lacks it." Two dimensions in particular only get a real verdict on the
-`full-server` transport:
+run often means "this transport can't exercise it here," not "the harness lacks
+it." Two dimensions in particular only get a real verdict on the `full-server`
+transport:
 
-| Dimension | sdk-inproc | full-server | native-tui |
+| Dimension | sdk-inproc (`--fast`) | full-server (default) | native-tui |
 |---|---|---|---|
 | Basic turn, Streaming, Model override, Interrupt | ✓ | ✓ | ✓ |
 | **Tool calling** | · (harness dispatches tools internally) | ✓ (server-dispatched builtin) | · (not yet wired) |
 | **Policy DENY** | · (wrap-direct: no tool-call policy hook) | ✓ (spec-baked deny, enforced) | · (not yet wired) |
 
-So to see Tool calling and Policy DENY actually proven, run the SDK harnesses
-over `full-server`:
+Because `full-server` sees everything `sdk-inproc` does *plus* these two, it is
+the **default** for SDK harnesses — a plain live run proves Tool calling and
+Policy DENY out of the box:
 
 ```
-python -m tests.harness_bench --harness claude-sdk --profile oss --transport full-server
+python -m tests.harness_bench --harness claude-sdk --profile oss
 ```
 
 Live-verified: `claude-sdk` completes the full matrix on `full-server` —
 Tool calling `✓` and Policy DENY `✓` (the deny is delivered and the blocked
-call does not stall the turn). The default `--profile oss` run shows `·` for
-those two columns only because it uses `sdk-inproc` (for SDK harnesses) and
-`native-tui` (for natives), neither of which routes a tool call through a
-server policy evaluation.
+call does not stall the turn). Add `--fast` to trade that coverage for a quicker
+run on `sdk-inproc`; those two columns then show `·`, since neither `sdk-inproc`
+nor `native-tui` (for natives) routes a tool call through a server policy
+evaluation.
 
 `full-server` covers **SDK harnesses only** — it registers the harness via an
 agent bundle, which is the SDK-wrap path; native harnesses need the host-daemon
 provisioning the `native-tui` driver owns. So Tool calling / Policy DENY for
 native harnesses remain genuinely unwired (a follow-up), distinct from the
-sdk-inproc `·` which is a transport limitation with `full-server` as the answer.
+`--fast` (sdk-inproc) `·` which is a transport limitation the default
+`full-server` run already answers.
 
 ## Plugin seamlessness: where it is and isn't
 

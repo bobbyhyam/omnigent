@@ -168,6 +168,7 @@ async def run_harness(
     databricks_profile: str | None = None,
     live: bool = True,
     transport: str | None = None,
+    fast: bool = False,
     progress: Progress | ProgressSink | None = None,
     shared_full_server=None,
 ) -> HarnessReport:
@@ -181,7 +182,9 @@ async def run_harness(
         cell ``SKIPPED`` with an "offline" note) without spawning
         anything — used for a fast ``--list``/dry render.
     :param transport: ``--transport`` override; wins over the profile's
-        declared transport when set (see :func:`resolve_driver_class`).
+        family default (see :func:`resolve_driver_class`).
+    :param fast: ``--fast`` — downgrade the SDK family to sdk-inproc (skip the
+        server boot, trading Tool calling + Policy DENY coverage).
     :param progress: A :class:`ProgressSink` (structured events), a plain
         per-line callback (adapted), or ``None`` (silent).
     :param shared_full_server: An optional shared
@@ -197,7 +200,7 @@ async def run_harness(
     if not live:
         return _uniform_report(profile, probes, ProbeResult.skipped("offline (declared shown)"))
 
-    driver_cls = resolve_driver_class(profile, override=transport)
+    driver_cls = resolve_driver_class(profile, override=transport, fast=fast)
     unavailable = driver_cls.unavailable(profile, databricks_profile=databricks_profile)
     if unavailable is not None:
         _emit(sink, HarnessSkipped(profile.harness, unavailable))
@@ -276,6 +279,7 @@ async def run_bench(
     databricks_profile: str | None = None,
     live: bool = True,
     transport: str | None = None,
+    fast: bool = False,
     progress: Progress | ProgressSink | None = None,
     jobs: int = 1,
 ) -> BenchMatrix:
@@ -295,7 +299,12 @@ async def run_bench(
         self-provision (each needs its own host daemon).
     """
     async with _maybe_shared_full_server(
-        profiles, databricks_profile=databricks_profile, live=live, transport=transport, jobs=jobs
+        profiles,
+        databricks_profile=databricks_profile,
+        live=live,
+        transport=transport,
+        fast=fast,
+        jobs=jobs,
     ) as shared:
         if jobs <= 1:
             reports = [
@@ -305,6 +314,7 @@ async def run_bench(
                     databricks_profile=databricks_profile,
                     live=live,
                     transport=transport,
+                    fast=fast,
                     progress=progress,
                     shared_full_server=shared,
                 )
@@ -322,6 +332,7 @@ async def run_bench(
                     databricks_profile=databricks_profile,
                     live=live,
                     transport=transport,
+                    fast=fast,
                     progress=progress,
                     shared_full_server=shared,
                 )
@@ -339,6 +350,7 @@ async def _maybe_shared_full_server(
     databricks_profile: str | None,
     live: bool,
     transport: str | None,
+    fast: bool,
     jobs: int,
 ):
     """Yield a shared full-server for parallel full-server runs, else ``None``.
@@ -353,7 +365,7 @@ async def _maybe_shared_full_server(
         full = [
             p
             for p in profiles
-            if resolve_driver_class(p, override=transport).transport == "full-server"
+            if resolve_driver_class(p, override=transport, fast=fast).transport == "full-server"
         ]
         if len(full) > 1:
             shared = SharedFullServer(databricks_profile)

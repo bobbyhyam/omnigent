@@ -213,7 +213,9 @@ async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None
             return TurnResult(cancelled=True)
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _OKDriver)
+    monkeypatch.setattr(
+        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _OKDriver
+    )
     try:
         profile = BenchProfile(
             harness="fake-sdk", model="m", env_prefix="HARNESS_FAKE_SDK_", marker="FAKE_OK"
@@ -236,7 +238,9 @@ async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None
     # A bare callable is adapted to a LineSink (structured events → lines).
     lines: list[str] = []
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _OKDriver)
+    monkeypatch.setattr(
+        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _OKDriver
+    )
     try:
         await run_harness(profile, databricks_profile="oss", live=True, progress=lines.append)
     finally:
@@ -282,7 +286,9 @@ async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -
         async def run_interrupt_turn(self) -> TurnResult:
             return TurnResult(cancelled=True)
 
-    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _SlowDriver)
+    monkeypatch.setattr(
+        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _SlowDriver
+    )
     profiles = [
         BenchProfile(harness=f"fake-{i}", model="m", env_prefix=f"HARNESS_F{i}_", marker="X")
         for i in range(3)
@@ -356,7 +362,9 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
 
     # bench imports SharedFullServer into its own namespace, so patch it there.
     monkeypatch.setattr(bench_mod, "SharedFullServer", _FakeShared)
-    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _FSDriver)
+    monkeypatch.setattr(
+        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _FSDriver
+    )
 
     profiles = [
         BenchProfile(
@@ -507,7 +515,7 @@ async def test_provisioning_failure_skips_and_tears_down(monkeypatch: pytest.Mon
     )
     monkeypatch.setattr(
         "tests.harness_bench.bench.resolve_driver_class",
-        lambda p, *, override: _FailingDriver,
+        lambda p, *, override=None, fast=False: _FailingDriver,
     )
 
     report = await run_harness(profile, databricks_profile="oss", live=True)
@@ -549,6 +557,36 @@ def test_native_tui_registered_and_gates() -> None:
 
     # No profile → the same capability-neutral skip contract as other drivers.
     assert NativeTuiDriver.unavailable(claude_native, databricks_profile=None) is not None
+
+
+def test_transport_resolution_family_default_and_fast() -> None:
+    """SDK family defaults to full-server; --fast downgrades it; natives unaffected.
+
+    This is the core of the "full-server by default, --fast to opt out" model:
+    the profile's transport is a family marker, and the effective driver comes
+    from family + flags (see resolve_transport_name).
+    """
+    from tests.harness_bench.transport import resolve_transport_name
+
+    sdk = BenchProfile(
+        harness="codex", model="m", env_prefix="X_", marker="X", transport="sdk-inproc"
+    )
+    native = BenchProfile(
+        harness="claude-native", model="m", env_prefix="X_", marker="X", transport="native-tui"
+    )
+
+    # SDK family: full-server by default, sdk-inproc under --fast.
+    assert resolve_transport_name(sdk, override=None, fast=False) == "full-server"
+    assert resolve_transport_name(sdk, override=None, fast=True) == "sdk-inproc"
+
+    # native: a single transport --fast does not touch.
+    assert resolve_transport_name(native, override=None, fast=False) == "native-tui"
+    assert resolve_transport_name(native, override=None, fast=True) == "native-tui"
+
+    # An explicit --transport wins over both the default and --fast, for any
+    # family (the caller validates the name against the registry separately).
+    assert resolve_transport_name(sdk, override="sdk-inproc", fast=False) == "sdk-inproc"
+    assert resolve_transport_name(sdk, override="native-tui", fast=True) == "native-tui"
 
 
 def test_full_server_skips_native_with_accurate_message() -> None:
