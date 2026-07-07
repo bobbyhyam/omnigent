@@ -5599,6 +5599,8 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     """
     import httpx
 
+    from omnigent.chat import _remote_headers
+
     cfg = _load_effective_config()
     base_url = _resolve_attach_server(server, cfg.get("server"))
     if base_url is None:
@@ -5608,7 +5610,9 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     base_url = base_url.rstrip("/")
     out_path = Path(output) if output else Path(f"{session_id}.jsonl")
 
-    with httpx.Client(base_url=base_url, timeout=30.0) as client:
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=30.0
+    ) as client:
         # Fetch session metadata (items fetched separately via pagination).
         resp = client.get(
             f"/v1/sessions/{session_id}",
