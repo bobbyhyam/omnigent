@@ -46,6 +46,12 @@ PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
+# WebSocket normal-closure code (RFC 6455 §7.4.1). A runner closes the
+# tunnel with this on the graceful path — a server-issued host.stop_runner
+# / managed runner-token TTL recycle / orderly shutdown. We treat it as a
+# *planned* recycle so in-flight relayed requests aborted by the ensuing
+# deregister surface as a retryable 503 rather than an opaque 500.
+_WS_NORMAL_CLOSURE_CODE = 1000
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -515,6 +521,10 @@ def create_runner_tunnel_router(
                         runner_id,
                     )
 
+            # Whether the tunnel closed on the graceful path (clean
+            # normal-closure) vs. an abnormal drop — decides whether
+            # in-flight requests are aborted retryably (planned recycle).
+            planned_close = False
             try:
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},
@@ -546,6 +556,10 @@ def create_runner_tunnel_router(
                             getattr(exc, "code", None),
                             getattr(exc, "reason", None),
                         )
+                        # A clean normal-closure is the graceful recycle path;
+                        # mark it so the deregister below aborts in-flight
+                        # requests retryably (503 runner_recycling), not 500.
+                        planned_close = getattr(exc, "code", None) == _WS_NORMAL_CLOSURE_CODE
                     else:
                         _logger.warning(
                             "Tunnel helper task failed for runner %s: %s",
@@ -563,7 +577,7 @@ def create_runner_tunnel_router(
                     receive_task,
                     return_exceptions=True,
                 )
-                registry.deregister(runner_id, session)
+                registry.deregister(runner_id, session, recycling=planned_close)
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id)
