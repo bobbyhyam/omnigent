@@ -74,6 +74,34 @@ def test_parse_without_prefix_defaults_to_openai() -> None:
     assert result == RoutedModel(provider="openai", model="gpt-5.4")
 
 
+@pytest.mark.parametrize(
+    ("model_string", "expected_provider"),
+    [
+        # Unprefixed vendor aliases (the strings a subscription/gateway login
+        # exposes) must infer their real provider, not fall through to openai.
+        ("claude-opus-4-8", "anthropic"),
+        ("claude-sonnet-5", "anthropic"),
+        ("gemini-2.5-flash", "gemini"),
+        ("grok-2", "xai"),
+        ("deepseek-chat", "deepseek"),
+        ("databricks-claude-sonnet-4", "databricks"),
+        # A genuinely unprefixed gpt-* stays on openai (the backward-compatible
+        # default is preserved for the one family it was actually correct for).
+        ("gpt-5.4", "openai"),
+    ],
+)
+def test_parse_without_prefix_infers_provider_from_model_prefix(
+    model_string: str,
+    expected_provider: str,
+) -> None:
+    """
+    Regression for #2071: an unprefixed ``claude-*`` (and every other
+    well-known vendor alias) must not be mis-inferred as provider ``openai``.
+    """
+    result = parse_model_string(model_string)
+    assert result == RoutedModel(provider=expected_provider, model=model_string)
+
+
 def test_unknown_provider_raises() -> None:
     with pytest.raises(OmnigentError, match="Unknown provider 'foobar'"):
         parse_model_string("foobar/some-model")

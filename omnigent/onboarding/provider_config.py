@@ -220,6 +220,48 @@ def provider_family_for_harness(harness: str | None) -> str | None:
     return harness_family(canonical)
 
 
+# Harnesses that speak the OpenAI Responses/Assistants API and can therefore
+# honor the native ``{"type": "web_search_preview"}`` hosted-tool passthrough.
+# Deliberately narrower than the whole ``openai`` provider family: OpenAI-*wire*
+# harnesses that are not the Responses API (native CLIs, qwen, antigravity)
+# cannot consume ``web_search_preview`` and must get the function-tool schema.
+_OPENAI_WEB_SEARCH_HARNESSES: frozenset[str] = frozenset({"openai-agents", "codex"})
+
+
+def harness_supports_openai_web_search(harness: str | None, model: str | None = None) -> bool:
+    """Return whether *harness* can consume the OpenAI ``web_search_preview``.
+
+    The ``web_search`` builtin emits OpenAI's native
+    ``{"type": "web_search_preview"}`` passthrough only when the session's
+    harness actually speaks the OpenAI Responses API (``openai-agents`` or
+    ``codex``); on any other harness — notably ``claude-sdk`` — the passthrough
+    is meaningless (it carries no function name, so the model is never offered
+    a callable ``web_search``) and the tool must fall back to a function-tool
+    schema. Keying on the **harness** rather than a model-string-inferred
+    provider is the correct determinant: the provider inference mis-typed
+    unprefixed aliases (e.g. ``claude-opus-4-8`` -> ``openai``) and hid
+    ``web_search`` from claude-sdk sessions (#2071).
+
+    :param harness: The agent's harness, e.g. :attr:`ExecutorSpec.harness_kind`
+        (``"claude_sdk"``, ``"codex"``, ``"omnigent"`` ...); ``None`` returns
+        ``False``.
+    :param model: The agent's model string. Consulted only when *harness* is
+        absent or the generic in-process ``"omnigent"`` executor, to recover
+        the implied harness via
+        :func:`~omnigent.llms.routing.infer_harness_from_model`.
+    :returns: ``True`` only for OpenAI-Responses-capable harnesses.
+    """
+    if not harness or harness == "omnigent":
+        from omnigent.llms.routing import infer_harness_from_model
+
+        harness = infer_harness_from_model(model or "") or harness
+    if not harness:
+        return False
+    canonical = canonicalize_harness(harness) or harness
+    canonical = _EXECUTOR_TYPE_HARNESS_ALIASES.get(canonical, canonical)
+    return canonical in _OPENAI_WEB_SEARCH_HARNESSES
+
+
 @dataclass(frozen=True)
 class FamilyConfig:
     """One provider family (``anthropic`` or ``openai``) for a harness surface.

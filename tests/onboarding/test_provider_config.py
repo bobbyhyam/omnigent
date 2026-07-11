@@ -14,6 +14,7 @@ from omnigent.onboarding.provider_config import (
     PI_SURFACE,
     default_provider_for_harness,
     harness_family,
+    harness_supports_openai_web_search,
     load_providers,
     provider_families,
     provider_family_for_harness,
@@ -94,6 +95,44 @@ def test_provider_family_for_harness_accepts_executor_type_spellings(
     same-family (anthropic) and carries history.
     """
     assert provider_family_for_harness(harness) == expected
+
+
+@pytest.mark.parametrize(
+    ("harness", "model", "expected"),
+    [
+        # OpenAI-Responses harnesses can honor the web_search_preview passthrough.
+        ("openai-agents", "gpt-5.4", True),
+        ("agents_sdk", "gpt-5.4", True),  # executor-type spelling
+        ("codex", "gpt-5.4", True),
+        # claude-sdk cannot — even with an unprefixed alias that used to
+        # mis-infer as provider openai (#2071).
+        ("claude-sdk", "claude-opus-4-8", False),
+        ("claude_sdk", "claude-opus-4-8", False),  # executor-type spelling
+        ("claude-native", "claude-opus-4-8", False),
+        # OpenAI-*wire* but not the Responses API: must NOT get the passthrough.
+        ("qwen", "qwen-max", False),
+        ("antigravity", "gemini-2.5-pro", False),
+        # Generic in-process executor with no explicit harness: recover the
+        # implied harness from the model prefix.
+        ("omnigent", "gpt-5.4", True),
+        ("omnigent", "claude-opus-4-8", False),
+        (None, "gpt-5.4", True),
+        (None, "claude-opus-4-8", False),
+        (None, None, False),
+    ],
+)
+def test_harness_supports_openai_web_search(
+    harness: str | None, model: str | None, expected: bool
+) -> None:
+    """Gate for the OpenAI ``web_search_preview`` passthrough (#2071).
+
+    Only OpenAI-Responses-capable harnesses (``openai-agents`` / ``codex``,
+    and their executor-type spellings) may emit the passthrough; every other
+    harness — including OpenAI-wire-but-not-Responses ones like ``qwen`` /
+    ``antigravity`` — falls back to the function-tool schema so ``web_search``
+    is actually advertised to the model.
+    """
+    assert harness_supports_openai_web_search(harness, model) is expected
 
 
 def test_resolve_secret_env_ref_accepts_omnigent_prefixed_alias(

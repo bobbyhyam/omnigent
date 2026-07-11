@@ -340,22 +340,33 @@ class ToolManager:
         """
         Build a :class:`WebSearchTool` for the parent's LLM.
 
-        Uses ``parse_model_string`` to infer the provider, except for
-        ``databricks-*`` models which don't support the native
-        ``web_search_preview`` schema and fall back to function-tool mode.
+        Emits the OpenAI-native ``web_search_preview`` passthrough only when
+        the agent's harness speaks the OpenAI Responses API
+        (``openai-agents`` / ``codex``); every other harness — and every
+        ``databricks-*`` model — falls back to function-tool mode.
 
         :param config: Spec-level tool config dict, e.g.
             ``{"api_key": "...", "engine_id": "..."}``.
         :returns: A configured :class:`WebSearchTool`.
         """
+        from omnigent.onboarding.provider_config import (
+            harness_supports_openai_web_search,
+        )
         from omnigent.tools.builtins.web_search import WebSearchTool
 
         llm_provider = None
         if self._spec.executor.model:
             model = self._spec.executor.model
-            # Databricks doesn't support web_search_preview; skip
-            # OpenAI provider inference for all databricks-* models.
-            if not model.startswith("databricks-"):
+            # The OpenAI-native ``web_search_preview`` passthrough is emitted
+            # only when the harness actually speaks the OpenAI Responses API.
+            # Keying on the harness (not a model-string-inferred provider) keeps
+            # ``web_search`` visible on claude-sdk sessions whose unprefixed
+            # alias would otherwise mis-infer as OpenAI (#2071). Databricks is
+            # excluded up front: it rides the openai wire but rejects
+            # ``web_search_preview`` with HTTP 400.
+            if not model.startswith("databricks-") and harness_supports_openai_web_search(
+                self._spec.executor.harness_kind, model
+            ):
                 from omnigent.llms.routing import parse_model_string
 
                 llm_provider = parse_model_string(model).provider

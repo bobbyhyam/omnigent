@@ -13,6 +13,7 @@ from omnigent.errors import OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
+    ExecutorSpec,
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
@@ -1164,4 +1165,80 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f'web_search emitted {{"type": "web_search_preview"}} for '
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
+    )
+
+
+def test_web_search_emits_web_search_preview_for_openai_agents_harness() -> None:
+    """
+    An OpenAI-Responses harness (``agents_sdk`` -> ``openai-agents``) with a
+    gpt-* model keeps the native ``web_search_preview`` passthrough — the
+    harness gate must not over-correct and strip it from OpenAI sessions.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="gpt-5.4"),
+        executor=ExecutorSpec(type="agents_sdk", model="gpt-5.4"),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    assert tool.get_schema() == {"type": "web_search_preview"}, (
+        "web_search must keep the OpenAI passthrough on an openai-agents harness"
+    )
+
+
+def test_web_search_does_not_emit_web_search_preview_for_claude_sdk_harness() -> None:
+    """
+    Regression for #2071: on a ``claude_sdk`` harness the ``web_search``
+    builtin must NOT emit ``{"type": "web_search_preview"}`` — even though the
+    unprefixed model alias ``claude-opus-4-8`` used to mis-infer as provider
+    ``openai``. It must fall back to a named function schema so the model is
+    actually offered a callable ``web_search``.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(type="claude_sdk", model="claude-opus-4-8"),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview", (
+        f"web_search leaked the OpenAI passthrough onto a claude_sdk harness. "
+        f"Got schema: {schema!r}"
+    )
+    assert schema.get("function", {}).get("name") == "web_search", (
+        f"web_search must advertise a named function schema on claude_sdk. Got schema: {schema!r}"
+    )
+
+
+def test_web_search_not_preview_for_omnigent_claude_sdk_harness() -> None:
+    """
+    Regression for #2071 in our exact production shape: an ``omnigent``
+    executor whose ``config.harness`` is ``claude-sdk`` (with an unprefixed
+    ``claude-opus-4-8``) must NOT emit ``{"type": "web_search_preview"}``.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            model="claude-opus-4-8",
+            config={"harness": "claude-sdk"},
+        ),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview", (
+        f"web_search leaked the OpenAI passthrough onto an omnigent/claude-sdk "
+        f"harness. Got schema: {schema!r}"
     )

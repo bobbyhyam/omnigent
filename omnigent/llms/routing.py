@@ -33,6 +33,22 @@ PROVIDER_CONFIGS: dict[str, str | None] = {
 
 _DEFAULT_PROVIDER = "openai"
 
+# When a model string carries no ``provider/`` prefix, its provider is
+# inferred from a well-known model-name prefix (e.g. an unprefixed
+# ``claude-opus-4-8`` routes to ``anthropic``, not the ``_DEFAULT_PROVIDER``).
+# Without this, every unprefixed alias fell through to ``openai`` — which
+# mis-typed non-OpenAI models and, for example, made the OpenAI-native
+# ``web_search_preview`` passthrough leak onto a claude-sdk session (#2071).
+# Genuinely unprefixed ``gpt-*`` stays on ``openai`` via the trailing default.
+_UNPREFIXED_MODEL_PROVIDER: dict[str, str] = {
+    "claude-": "anthropic",
+    "gemini-": "gemini",
+    "grok-": "xai",
+    "deepseek-": "deepseek",
+    "databricks-": "databricks",
+    "gpt-": "openai",
+}
+
 
 @dataclass
 class RoutedModel:
@@ -52,8 +68,9 @@ def parse_model_string(model: str) -> RoutedModel:
     """
     Parse a ``"provider/model-name"`` string into its components.
 
-    If no ``"/"`` is present, the provider defaults to ``"openai"``
-    for backward compatibility.
+    If no ``"/"`` is present, the provider is inferred from a well-known
+    model-name prefix (e.g. ``"claude-"`` -> ``"anthropic"``) and otherwise
+    defaults to ``"openai"`` for backward compatibility.
 
     :param model: The model string, e.g.
         ``"anthropic/claude-sonnet-4-20250514"`` or ``"gpt-5.4"``.
@@ -64,6 +81,10 @@ def parse_model_string(model: str) -> RoutedModel:
         provider, model_name = model.split("/", 1)
     else:
         provider = _DEFAULT_PROVIDER
+        for prefix, inferred in _UNPREFIXED_MODEL_PROVIDER.items():
+            if model.startswith(prefix):
+                provider = inferred
+                break
         model_name = model
 
     if provider not in PROVIDER_CONFIGS:
