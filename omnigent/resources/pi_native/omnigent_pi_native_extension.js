@@ -1102,6 +1102,12 @@ module.exports = function (pi) {
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
+  // Response id shared across a turn's ``running`` → ``idle`` status pair.
+  // The web store only clears its local "streaming" flag when an ``idle``
+  // edge's response_id matches the ``running`` edge that opened the turn; a
+  // fresh id per edge would leave the composer stuck in "queued" until a tab
+  // switch resets the store. Minted on agent_start, reused on agent_end.
+  let turnStatusResponseId = null;
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
@@ -1555,11 +1561,12 @@ module.exports = function (pi) {
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
+    turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
     await postEvent(config, {
       type: "external_session_status",
       data: {
         status: "running",
-        response_id: `pi-${Date.now()}-${++sequence}`,
+        response_id: turnStatusResponseId,
       },
     });
   });
@@ -1584,8 +1591,15 @@ module.exports = function (pi) {
     if (changed) await postSessionUsage();
     await postEvent(config, {
       type: "external_session_status",
-      data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
+      data: {
+        status: "idle",
+        // Reuse the running edge's id so the web store's idle-clear matches
+        // and drops the "streaming" flag. Fall back to a fresh id if this
+        // idle somehow lands without a preceding agent_start.
+        response_id: turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`,
+      },
     });
+    turnStatusResponseId = null;
   });
 
   pi.on("turn_start", async (event, ctx) => {
