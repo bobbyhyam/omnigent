@@ -2359,14 +2359,7 @@ export function NewChatLandingScreen() {
   // harness override wins over its spec harness), so overriding Polly/Debby to a
   // non-routable harness (e.g. Cursor) correctly drops routing eligibility.
   const effectiveHarness = pickedHarness ?? selectedAgent?.harness ?? "";
-  // "auto" is routable by definition (the router picks a routable harness).
-  // An empty effectiveHarness means the agent uses its spec default — treat
-  // it as eligible too so routing shows for agents without an explicit harness.
-  const smartRoutingEligible =
-    smartRoutingEnabled &&
-    (effectiveHarness === AUTO_HARNESS_ID ||
-      effectiveHarness === "" ||
-      _ROUTABLE_HARNESSES.has(effectiveHarness));
+  const smartRoutingEligible = smartRoutingEnabled && _ROUTABLE_HARNESSES.has(effectiveHarness);
   // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
