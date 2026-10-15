@@ -357,9 +357,9 @@ def register_resource_routes(
         ):
             # Each native harness contributes only the ensure hooks that differ
             # from the uniform base; a single _ensure_native_terminal call runs
-            # them. The 4 uniform harnesses (goose/kiro/hermes/qwen) need only the
-            # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
-            # via build_context; codex/antigravity add an ownership check (and
+            # them. pi/opencode/cursor/kimi/devin/goose/hermes/kiro/qwen/claude
+            # resolve an agent spec via build_context (its os_env carries the
+            # terminal sandbox); codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
             _ensure_locks = _require_full_native_lock_coverage(
                 {

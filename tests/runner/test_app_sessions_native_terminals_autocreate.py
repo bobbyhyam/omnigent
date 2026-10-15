@@ -1251,6 +1251,87 @@ async def test_auto_create_native_terminal_inherits_agent_sandbox(
     assert captured["parent_os_env"] is agent_os_env
 
 
+@pytest.mark.parametrize("terminal_name", ["goose", "hermes", "kiro", "qwen"])
+@pytest.mark.asyncio
+async def test_native_launch_arms_resolve_agent_spec_for_terminal(
+    terminal_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The create-session and ensure arms hand goose/hermes/kiro/qwen the agent spec.
+
+    The builders can only inherit ``os_env.sandbox`` (#10262) if the launch
+    context carries ``agent_spec``. Before the fix these four harnesses were
+    missing from the create-session ``_launch_resolve_spec`` arm in
+    ``omnigent.runner.app`` and from the ensure ``build_context`` arm in
+    ``omnigent.runner.resource_routes``, so ``ctx.agent_spec`` stayed ``None``
+    on both paths and the terminal fell back to the platform-default sandbox.
+
+    :param terminal_name: Native terminal name, e.g. ``"hermes"``.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    native_spec = AgentSpec(
+        spec_version=1,
+        name=f"{terminal_name}_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": f"{terminal_name}-native"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    launched_specs: list[Any] = []
+
+    async def _fake_launch(ctx: Any) -> SessionResourceView:
+        launched_specs.append(ctx.agent_spec)
+        return SessionResourceView(
+            id=f"terminal_{terminal_name}_main",
+            type="terminal",
+            session_id=ctx.session_id,
+            name=f"{terminal_name}:main",
+        )
+
+    monkeypatch.setattr(f"omnigent.runner.native._launch_{terminal_name}", _fake_launch)
+
+    session_id = "c4b1e6f2a9d84e0b8f3a7c5d2e1b9a60"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "9a3f0c1e7b2d4e6f8a0b1c2d3e4f5a6b"},
+        )
+        assert created.status_code == 201, created.text
+        # The fake launch registers no terminal, so the ensure arm builds again.
+        ensured = await client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={
+                "terminal": terminal_name,
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
+        )
+        assert ensured.status_code == 200, ensured.text
+
+    assert len(launched_specs) == 2, launched_specs
+    for launched_spec in launched_specs:
+        assert launched_spec is not None, "launch context carried no agent spec"
+        assert _agent_os_env_from_spec(launched_spec) is agent_os_env
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_claude_terminal_passes_session_effort(
