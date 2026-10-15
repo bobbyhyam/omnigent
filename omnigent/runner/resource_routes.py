@@ -477,7 +477,15 @@ def register_resource_routes(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi", "devin"):
+            elif terminal_name in (
+                "cursor",
+                "kimi",
+                "devin",
+                "goose",
+                "hermes",
+                "kiro",
+                "qwen",
+            ):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -918,6 +926,7 @@ def register_resource_routes(
                         _publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        agent_spec=await _resolve_session_agent_spec_or_none(session_id),
                     )
                 except Exception:
                     _logger.exception(
